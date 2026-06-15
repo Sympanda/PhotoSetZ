@@ -1,0 +1,112 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 1  ·  Cardinal simulation  ·  10-year depth  ·  IID baseline
+# Set Transformer — two-stage training (MLP point → frozen encoder → MDN)
+# Based on ts1_10yr_st.yaml / 08_st architecture
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts1_10yr_2part_st
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts1_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts1_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type:      set_transformer
+  token_dim: 5           # [m_norm, log_λ, log_Δλ, survey_id, σ_norm]
+  use_coverage: true      # n_active/n_available scalar fed to head
+  set_transformer:
+    embed_dim:        384
+    n_heads:          12
+    n_attn_layers:    4
+    ffn_dim:          1024
+    n_pma_seeds:      1
+    dropout:          0.1
+    pre_embed_hidden: [128, 256]
+
+head:
+  type: mdn              # stage 2 posterior head (stage 1 overrides to mlp_regressor)
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.2
+    huber_delta: 0.5
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [64]
+    dropout:     0.2
+    activation:  gelu
+  mdn:
+    n_components: 8
+    hidden_dims:  [256, 512, 256, 128, 64]
+    dropout:      0.1
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          512
+  lr:                  2.0e-4
+  weight_decay:        2.0e-4
+  epochs:              250      # unused when split_training; stage1/2 set their own
+  lr_scheduler:        cosine
+  warmup_epochs:       25
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 20
+
+  fisher_lambda: 0.0
+  spread_lambda: 5.0
+  huber_lambda:  0.2
+  huber_delta:   0.5
+  val_dropout:   true
+
+  full_filter_epochs:     0
+  dropout_resume_lr_mult: 1
+  early_stop_min_epoch:   25
+
+  post_hoc_calibration:
+    enabled:    true
+    sigma_min:  0.2
+    sigma_max:  1.0
+
+  # ── Two-stage pipeline ──────────────────────────────────────────────────────
+  split_training: true
+  # Stage-2 only: skip stage 1 and load encoder from an existing run, e.g.:
+  # stage1_checkpoint: outputs/ts1_10yr_10_st/best_point.pt
+  stage1:
+    head: mlp_regressor
+    epochs: 150
+    huber_lambda: 0.2
+    use_coverage: true    # concat n_active/n_max to latent → head (384+1)
+    early_stop_patience: 20
+  stage2:
+    head: mdn
+    epochs: 80
+    freeze_encoder: true
+    use_coverage: true    # same coverage concat before MDN trunk
+    huber_lambda: 0.1
+    spread_lambda: 5.0
+    early_stop_patience: 15
+
+  dropout:
+    p_complete:               0.40
+    p_preset:                 0.20
+    p_survey_drop:            0.20
+    p_aggressive:             0.20
+    aggressive_rate_low:      0.30
+    aggressive_rate_high:     0.80
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.40
+    filter_rate_after_survey: 0.25
+    min_filters:              3

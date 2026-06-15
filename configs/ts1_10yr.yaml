@@ -1,0 +1,100 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 1  ·  Cardinal simulation  ·  10-year depth  ·  IID baseline
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# What this dataset is:
+#   The simplest, cleanest task.  Training and test galaxies are drawn from the
+#   same magnitude-limited population (i < 23.5), so the distributions match.
+#   Photometry uses 10-year Rubin + Roman HLWAS depths — deep, low-noise.
+#   This is the best-case scenario and a useful sanity check before tackling
+#   the harder task sets.
+#
+# Training strategy notes:
+#   Standard settings work well here.  p_complete=0.15 ensures the model also
+#   trains on the full 16-token set, which should approach the true optimum for
+#   this clean IID sample.  log_target=true always recommended for PZDC since
+#   the redshift distribution extends to z~3.
+#
+# Parquet filenames after running scripts/download_pzdc.py:
+#   Training : pz_challenge_taskset_1_cardinal_training_10yr.parquet
+#   Test     : pz_challenge_taskset_1_cardinal_test_10yr.parquet
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts1_10yr_01_deepset_att
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts1_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts1_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true   # σ_m is available and informative — use it
+
+model:
+  type:      deepsets
+  token_dim: 5           # [m_norm, log_λ, log_Δλ, survey_id, σ_norm]
+  use_coverage: true   # n_active/n_available scalar fed to head
+  deepsets:
+    phi_hidden: [256, 256]
+    latent_dim: 256
+    rho_hidden: [512, 512, 256]
+    embed_dim:  256
+    pooling:    attention
+    dropout:    0.2
+    activation: gelu
+
+head:
+  type: mdn
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.2
+    huber_delta: 0.5
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [64]
+    dropout:     0.2
+    activation:  gelu
+  mdn:
+    n_components: 8
+    hidden_dims:  [512, 256, 128]
+    dropout:      0.1
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          256
+  lr:                  5.0e-4
+  weight_decay:        2.0e-4
+  epochs:              200
+  lr_scheduler:        cosine
+  warmup_epochs:       10
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 20
+
+  # Posterior calibration (probabilistic heads: MDN, BinnedPDF, NSF)
+  fisher_lambda: 0.0      # penalises over-confident (sharp) posteriors — U-shaped PIT
+  spread_lambda: 0.01    # penalises over-dispersed (broad) posteriors — n-shaped PIT
+  val_dropout:   true     # second val pass with dropout; seed fixed per epoch
+
+  dropout:
+    # IID clean sample — generous complete-set exposure is fine
+    p_complete:               0.15
+    p_preset:                 0.25
+    p_survey_drop:            0.25
+    p_aggressive:             0.35
+    aggressive_rate_low:      0.30
+    aggressive_rate_high:     0.80
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.40
+    filter_rate_after_survey: 0.25
+    min_filters:              3

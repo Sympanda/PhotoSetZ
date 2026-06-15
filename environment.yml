@@ -1,0 +1,21 @@
+name: deepset-z
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy>=1.26
+  - pandas>=2.0
+  - pyarrow>=14
+  - pyyaml>=6.0
+  - tqdm>=4.65
+  - pip
+  - ipywidgets>=8.0.0
+  - jupyterlab>=4.0.0
+  - pip:
+      # Installed via pip so the arm64/MPS-enabled wheel is fetched automatically.
+      # Do NOT install torch from conda-forge on Apple Silicon — the pip wheel
+      # is the official MPS-enabled build.
+      - torch
+      - torchvision
+      - matplotlib>=3.7.0

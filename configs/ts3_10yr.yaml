@@ -1,0 +1,114 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 3  ·  Cardinal simulation  ·  10-year depth  ·  Realistic spec sample
+#
+# ⚠  DATA NOT YET PUBLIC — Task Set 3 is not in the current public archive.
+#    This config is a placeholder for when the data is released.
+#    Check: https://pz-data-challenge.readthedocs.io/en/latest/
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# What this dataset is:
+#   The most realistic spectroscopic training sample in the challenge.
+#   Training galaxies come from emulated real spectroscopic surveys:
+#     • DESI BGS / ELG / LRG — applied to the whole field
+#     • zCOSMOS + COSMOS2020  — applied to a small (~1 deg²) area
+#     • DEEP2, VVDSf02        — applied to other small areas
+#   Each survey selects a different redshift range, creating a highly non-uniform
+#   training n(z).  For COSMOS2020 objects, the "truth" is actually a many-band
+#   photo-z (column: redshift_manyband) — not a true spectroscopic z.
+#   Test set: all i < 25.5 (same as TS2).
+#
+# Training strategy notes:
+#   More severe selection bias than TS2 because the small-area surveys
+#   (zCOSMOS, COSMOS2020) dominate the high-z coverage with very few objects
+#   over a tiny footprint.  The model must generalise from this patchy, biased
+#   training n(z) to the full test population.
+#
+#   • Highest dropout regularisation of all task sets.
+#   • Largest huber_delta: many training galaxies at extreme redshifts will
+#     appear anomalous relative to the training distribution.
+#   • Aggressive dropout helps because it teaches the model to work with
+#     partial photometry — the fainter test objects will have more NaNs.
+#   • Consider using the MDN head for this task: the multi-modal n(z) of the
+#     training set makes it harder for a unimodal regressor.
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts3_10yr
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts3_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts3_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type:      deepsets
+  token_dim: 5
+  use_coverage: true   # n_active/n_available scalar fed to head
+  deepsets:
+    phi_hidden: [256, 256]
+    latent_dim: 256
+    rho_hidden: [512, 512, 256]
+    embed_dim:  256
+    pooling:    attention
+    dropout:    0.35          # heaviest regularisation
+    activation: gelu
+
+head:
+  # MDN recommended for this task: the patchy multi-survey training n(z) can
+  # produce multi-modal posteriors, and MDN captures that naturally.
+  # Switch type to mlp_regressor for a quick point-estimate baseline.
+  type: mdn
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.35
+    huber_delta: 1.5
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [128, 64]
+    dropout:     0.3
+    activation:  gelu
+  mdn:
+    n_components: 10          # extra components for complex multi-survey posteriors
+    hidden_dims:  [256, 128]
+    dropout:      0.3
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          256
+  lr:                  2.0e-4       # conservative LR for noisy biased training signal
+  weight_decay:        4.0e-4
+  epochs:              300          # more epochs to converge with high dropout
+  lr_scheduler:        cosine
+  warmup_epochs:       20
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 40
+
+  # Posterior calibration (probabilistic heads: MDN, BinnedPDF, NSF)
+  fisher_lambda: 0.0      # penalises over-confident (sharp) posteriors — U-shaped PIT
+  spread_lambda: 0.01    # penalises over-dispersed (broad) posteriors — n-shaped PIT
+  val_dropout:   true     # second val pass with dropout; seed fixed per epoch
+
+  dropout:
+    p_complete:               0.05  # almost never train on full set
+    p_preset:                 0.15
+    p_survey_drop:            0.35
+    p_aggressive:             0.45
+    aggressive_rate_low:      0.40
+    aggressive_rate_high:     0.90  # push toward very sparse coverage
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.55
+    filter_rate_after_survey: 0.40
+    min_filters:              3

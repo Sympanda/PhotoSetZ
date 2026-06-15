@@ -1,0 +1,94 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 2  ·  Cardinal simulation  ·  10-year depth  ·  Spectroscopic bias
+# Set Transformer encoder variant — compare against pzdc_ts2_10yr.yaml
+#
+# The transformer's attention mechanism may offer an advantage here: it can
+# learn which filter tokens are most informative for each galaxy individually,
+# potentially better handling the faint/unusual objects in the test distribution
+# that are underrepresented in the biased training set.
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts2_10yr_01_st
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts2_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts2_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type:      set_transformer
+  token_dim: 5           # [m_norm, log_λ, log_Δλ, survey_id, σ_norm]
+  use_coverage: true   # n_active/n_available scalar fed to head
+  set_transformer:
+    embed_dim:        384
+    n_heads:          12      # 256 / 8 = 32 per head
+    n_attn_layers:    4
+    ffn_dim:          512    # 2 × embed_dim (conservative for regularisation)
+    n_pma_seeds:      1
+    dropout:          0.1
+    pre_embed_hidden: [128,256]  # slightly larger than Ellen since token_dim=5
+
+head:
+  type: mdn
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.2
+    huber_delta: 0.5
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [64]
+    dropout:     0.2
+    activation:  gelu
+  mdn:
+    n_components: 8
+    hidden_dims:  [256, 512, 256, 128, 64]
+    dropout:      0.1
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          512
+  lr:                  3.0e-4   # transformers benefit from slightly lower LR
+  weight_decay:        2.0e-4
+  epochs:              250
+  lr_scheduler:        cosine
+  warmup_epochs:       15       # longer warmup is important for transformers
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 20
+
+  # Posterior calibration (probabilistic heads: MDN, BinnedPDF, NSF)
+  fisher_lambda: 0.0      # penalises over-confident (sharp) posteriors — U-shaped PIT
+  spread_lambda: 5.0    # ramp up (e.g. 1–10) if PIT stays n-shaped
+  huber_lambda:  0.20     # auxiliary point loss on top of NLL (σ_NMAD)
+  huber_delta:   0.5
+  val_dropout:   true     # second val pass with dropout; seed fixed per epoch
+
+  # Full-filter curriculum: learn the complete LSST+Roman map first
+  full_filter_epochs:     0
+  dropout_resume_lr_mult: 1   # gentle LR bump when dropout resumes
+  early_stop_min_epoch:   20     # patience only counts after curriculum
+
+  dropout:
+    p_complete:               0.40
+    p_preset:                 0.20
+    p_survey_drop:            0.20
+    p_aggressive:             0.20
+    aggressive_rate_low:      0.30
+    aggressive_rate_high:     0.80
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.40
+    filter_rate_after_survey: 0.25
+    min_filters:              3

@@ -1,0 +1,105 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 2  ·  Cardinal simulation  ·  10-year depth  ·  Spectroscopic bias
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# What this dataset is:
+#   The training set is drawn from galaxies passing spectroscopic selection
+#   functions applied to the whole field (bright, relatively blue, low-z biased).
+#   The TEST set contains ALL galaxies with observed i < 25.5 — significantly
+#   deeper and more diverse than the training set.
+#
+#   CRITICAL: train ≠ test distribution.  This is the classic spec-z bias
+#   problem in photo-z: your reference/training sample is not representative
+#   of the data you ultimately want to apply the model to.
+#
+# Training strategy notes:
+#   • Reduce p_complete: the model shouldn't over-fit to the bright/complete
+#     training distribution.
+#   • Increase p_aggressive and aggressive_rate_high: force the model to be
+#     robust to partial coverage, since the test galaxies are fainter and more
+#     likely to have NaN bands.
+#   • Lower lr + more patience: domain shift means val loss (from training dist)
+#     won't perfectly track test performance.
+#   • Larger huber_delta: be more tolerant of outliers from the tail galaxies
+#     the training set barely covers.
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts2_10yr
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts2_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts2_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type:      deepsets
+  token_dim: 5
+  use_coverage: true   # n_active/n_available scalar fed to head
+  deepsets:
+    phi_hidden: [256, 256]
+    latent_dim: 256
+    rho_hidden: [512, 512, 256]
+    embed_dim:  256
+    pooling:    attention
+    dropout:    0.3           # higher dropout to prevent over-fitting biased sample
+    activation: gelu
+
+head:
+  type: mlp_regressor
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.3
+    huber_delta: 1.0          # more tolerant of tail outliers
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [64]
+    dropout:     0.2
+    activation:  gelu
+  mdn:
+    n_components: 8           # more components to model complex posteriors
+    hidden_dims:  [128, 64]
+    dropout:      0.2
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          256
+  lr:                  3.0e-4
+  weight_decay:        3.0e-4       # stronger L2 to combat overfitting to biased sample
+  epochs:              250
+  lr_scheduler:        cosine
+  warmup_epochs:       15
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 30           # be generous — val loss from biased sample is noisy
+
+  # Posterior calibration (probabilistic heads: MDN, BinnedPDF, NSF)
+  fisher_lambda: 0.0      # penalises over-confident (sharp) posteriors — U-shaped PIT
+  spread_lambda: 0.01    # penalises over-dispersed (broad) posteriors — n-shaped PIT
+  val_dropout:   true     # second val pass with dropout; seed fixed per epoch
+
+  dropout:
+    # Reduce complete-set: biased training data means full-set training
+    # can over-fit the spectroscopic selection
+    p_complete:               0.05
+    p_preset:                 0.20
+    p_survey_drop:            0.30
+    p_aggressive:             0.45
+    aggressive_rate_low:      0.35
+    aggressive_rate_high:     0.85
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.50
+    filter_rate_after_survey: 0.35
+    min_filters:              3

@@ -1,0 +1,86 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 2  ·  Cardinal simulation  ·  1-year depth  ·  Spectroscopic bias
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Same spectroscopic selection bias as TS2-10yr but with shallower photometry.
+# Combines two challenges: domain shift (spec ≠ photometric sample) AND noisier
+# measurements.  Useful for testing early-LSST-era performance under bias.
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts2_1yr
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts2_cardinal_1yr_train.parquet
+  test_path:  data/pzdc/ts2_cardinal_1yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type:      deepsets
+  token_dim: 5
+  use_coverage: true   # n_active/n_available scalar fed to head
+  deepsets:
+    phi_hidden: [256, 256]
+    latent_dim: 256
+    rho_hidden: [512, 512, 256]
+    embed_dim:  256
+    pooling:    attention
+    dropout:    0.3
+    activation: gelu
+
+head:
+  type: mlp_regressor
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.3
+    huber_delta: 1.0
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [64]
+    dropout:     0.2
+    activation:  gelu
+  mdn:
+    n_components: 8
+    hidden_dims:  [128, 64]
+    dropout:      0.2
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          256
+  lr:                  2.5e-4
+  weight_decay:        3.0e-4
+  epochs:              250
+  lr_scheduler:        cosine
+  warmup_epochs:       15
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 30
+
+  # Posterior calibration (probabilistic heads: MDN, BinnedPDF, NSF)
+  fisher_lambda: 0.0      # penalises over-confident (sharp) posteriors — U-shaped PIT
+  spread_lambda: 0.01    # penalises over-dispersed (broad) posteriors — n-shaped PIT
+  val_dropout:   true     # second val pass with dropout; seed fixed per epoch
+
+  dropout:
+    p_complete:               0.05
+    p_preset:                 0.20
+    p_survey_drop:            0.30
+    p_aggressive:             0.45
+    aggressive_rate_low:      0.40
+    aggressive_rate_high:     0.90
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.50
+    filter_rate_after_survey: 0.40
+    min_filters:              3

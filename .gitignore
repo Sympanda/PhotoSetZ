@@ -1,0 +1,88 @@
+# ── Training outputs (regenerate with src/train.py) ──────────────────────────
+outputs/
+benchmarks/
+submissions/
+
+# ── Data (download / prepare locally — see README) ─────────────────────────
+*.parquet
+*.hdf5
+data/pzdc/hdf5/
+data/pzdc/_pz_data_challenge_repo/
+
+# Keep small filter transmission curves (needed for token features)
+!data/ellen/*.res
+
+# ── Model checkpoints & predictions ──────────────────────────────────────────
+*.pt
+*.npz
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# ── Jupyter ────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── IDE & editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ── OS junk ──────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ── Secrets & local env ──────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.yaml
+
+# ── Logs & temp ──────────────────────────────────────────────────────────────
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ── macOS / PyTorch multiprocessing (orphan shm) ─────────────────────────────
+/tmp/torch_*

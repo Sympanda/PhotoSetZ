@@ -1,0 +1,99 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 4  ·  Cardinal simulation  ·  1-year depth  ·  Blending + spec bias
+# Set Transformer encoder variant — compare against pzdc_ts4_1yr.yaml
+#
+# ⚠  DATA NOT YET PUBLIC — Task Set 4 is not in the current public archive.
+#    This config is a placeholder for when the data is released.
+#    Check: https://pz-data-challenge.readthedocs.io/en/latest/
+#
+# Blended objects may benefit from transformer attention: the model can learn
+# to up-weight filters that carry discriminating colour information for the
+# dominant blend component, effectively doing implicit deblending via attention.
+# Combine with include_errors=true — the error pattern of a blended source
+# differs systematically from an isolated galaxy and attention can exploit this.
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts4_1yr_st
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts4_cardinal_1yr_train.parquet
+  test_path:  data/pzdc/ts4_cardinal_1yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type:      set_transformer
+  token_dim: 5
+  use_coverage: true   # n_active/n_available scalar fed to head
+  set_transformer:
+    embed_dim:        256
+    n_heads:          8
+    n_attn_layers:    4      # deeper — blend ambiguity needs more representational power
+    ffn_dim:          512
+    n_pma_seeds:      1
+    dropout:          0.15
+    pre_embed_hidden: [128]
+
+head:
+  # Binned PDF recommended: blending creates genuine multi-modal posteriors
+  type: binned_pdf
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.35
+    huber_delta: 2.0
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [256, 128]
+    dropout:     0.3
+    activation:  gelu
+  mdn:
+    n_components: 10
+    hidden_dims:  [256, 128]
+    dropout:      0.3
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          512
+  lr:                  1.5e-4
+  weight_decay:        4.0e-4
+  epochs:              300
+  lr_scheduler:        cosine
+  warmup_epochs:       25
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 40
+
+  # Posterior calibration (probabilistic heads: MDN, BinnedPDF, NSF)
+  fisher_lambda: 0.0      # penalises over-confident (sharp) posteriors — U-shaped PIT
+  spread_lambda: 0.01
+  huber_lambda:  1.0
+  huber_delta:   2.0
+  val_dropout:   true
+
+  full_filter_epochs:     25
+  dropout_resume_lr_mult: 1.5
+  early_stop_min_epoch:   25
+
+  dropout:
+    p_complete:               0.15
+    p_preset:                 0.10
+    p_survey_drop:            0.35
+    p_aggressive:             0.40
+    aggressive_rate_low:      0.40
+    aggressive_rate_high:     0.90
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.60
+    filter_rate_after_survey: 0.45
+    min_filters:              3

@@ -1,0 +1,98 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 3  ·  Cardinal simulation  ·  10-year depth  ·  Realistic spec sample
+# Set Transformer encoder variant — compare against pzdc_ts3_10yr.yaml
+#
+# ⚠  DATA NOT YET PUBLIC — Task Set 3 is not in the current public archive.
+#    This config is a placeholder for when the data is released.
+#    Check: https://pz-data-challenge.readthedocs.io/en/latest/
+#
+# The Set Transformer may be particularly well-suited here: the patchy multi-
+# survey training n(z) means some redshift regimes have very few training
+# objects, and cross-filter attention can extract more information from whatever
+# tokens are available, potentially helping generalisation.
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts3_10yr_st
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts3_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts3_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type:      set_transformer
+  token_dim: 5
+  use_coverage: true   # n_active/n_available scalar fed to head
+  set_transformer:
+    embed_dim:        256
+    n_heads:          8
+    n_attn_layers:    4      # deeper transformer for complex multi-survey training dist.
+    ffn_dim:          512
+    n_pma_seeds:      1
+    dropout:          0.1
+    pre_embed_hidden: [128]
+
+head:
+  # MDN recommended: multi-modal posteriors from multi-survey training
+  type: mdn
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout:     0.35
+    huber_delta: 1.5
+    activation:  leaky_relu
+  binned_pdf:
+    n_bins:      200
+    z_min:       0.0
+    z_max:       3.0
+    hidden_dims: [128, 64]
+    dropout:     0.3
+    activation:  gelu
+  mdn:
+    n_components: 10
+    hidden_dims:  [256, 128]
+    dropout:      0.3
+    sigma_min:    0.01
+    activation:   gelu
+
+training:
+  batch_size:          512
+  lr:                  1.5e-4
+  weight_decay:        4.0e-4
+  epochs:              300
+  lr_scheduler:        cosine
+  warmup_epochs:       25      # generous warmup for deep transformer + complex data
+  clip_grad_norm:      1.0
+  num_workers:         4
+  seed:                42
+  log_every:           200
+  val_every:           1
+  save_best:           true
+  early_stop_patience: 40
+
+  # Posterior calibration (probabilistic heads: MDN, BinnedPDF, NSF)
+  fisher_lambda: 0.0      # penalises over-confident (sharp) posteriors — U-shaped PIT
+  spread_lambda: 0.01
+  huber_lambda:  1.0
+  huber_delta:   0.5
+  val_dropout:   true
+
+  full_filter_epochs:     25
+  dropout_resume_lr_mult: 1.5
+  early_stop_min_epoch:   25
+
+  dropout:
+    p_complete:               0.20
+    p_preset:                 0.15
+    p_survey_drop:            0.35
+    p_aggressive:             0.30
+    aggressive_rate_low:      0.40
+    aggressive_rate_high:     0.90
+    max_surveys_to_drop:      2
+    p_filter_after_survey:    0.55
+    filter_rate_after_survey: 0.40
+    min_filters:              3

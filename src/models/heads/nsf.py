@@ -373,7 +373,8 @@ class NeuralSplineFlow(nn.Module):
         h_rep = heights.unsqueeze(1).expand(-1, n_mode, -1).reshape(B * n_mode, -1)
         d_rep = derivs.unsqueeze(1).expand(-1, n_mode, -1).reshape(B * n_mode, -1)
         _, log_pdf_rep = _rqs_forward(z_rep, w_rep, h_rep, d_rep, self.z_min, self.z_max)
-        z_pred = z_grid[log_pdf_rep.reshape(B, n_mode).argmax(-1)]   # (B,)
+        log_pdf_grid = log_pdf_rep.reshape(B, n_mode)
+        z_pred = z_grid[log_pdf_grid.argmax(dim=-1)]   # mode — reporting only
 
         result: Dict[str, torch.Tensor] = {
             "z_pred":  z_pred,
@@ -392,8 +393,13 @@ class NeuralSplineFlow(nn.Module):
             if spread_lambda > 0.0:
                 loss = loss + spread_lambda * self.spread_penalty(widths, heights, derivs)
             if huber_lambda > 0.0:
+                # Differentiable grid mean — do not use argmax mode in the loss.
+                pdf_grid = torch.exp(log_pdf_grid)
+                dz = (self.z_max - self.z_min) / max(n_mode - 1, 1)
+                norm = (pdf_grid.sum(dim=-1) * dz).clamp(min=1e-8)
+                z_mean = (pdf_grid * z_grid.unsqueeze(0)).sum(dim=-1) * dz / norm
                 loss = loss + huber_lambda * F.huber_loss(
-                    z_pred, z_true, delta=huber_delta,
+                    z_mean, z_true, delta=huber_delta,
                 )
 
             result["loss"] = loss

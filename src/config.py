@@ -16,7 +16,7 @@ from __future__ import annotations
 import yaml
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 # ------------------------------------------------------------------
@@ -51,9 +51,18 @@ class ModelConfig:
     token_dim:      int  = 4
     deepsets:       DeepSetsConfig       = field(default_factory=DeepSetsConfig)
     set_transformer: SetTransformerConfig = field(default_factory=SetTransformerConfig)
-    # Append n_active/n_available as a scalar to the pooled encoder embedding before
-    # the head (latent dim + 1). Default on for DeepSetZ; disable for flat benchmarks.
+    # Append n_active/n_total_filters as a scalar to the pooled encoder embedding
+    # before the head (latent dim + 1). Legacy coverage conditioning.
     use_coverage:   bool = True
+    # Fixed-size wavelength/coverage summaries (see coverage_summary.py).
+    use_coverage_summary: bool = False
+    # Separate MLP context path for NSF density estimation.
+    density_context_branch: bool = False
+    density_context_hidden: List[int] = field(default_factory=lambda: [256, 128])
+    density_context_dropout: float = 0.05
+    # Encoder bottleneck: false = disabled; int = latent dim (e.g. 64).
+    bottleneck: Union[bool, int] = False
+    bottleneck_dropout: float = 0.1
 
 
 # ------------------------------------------------------------------
@@ -101,15 +110,79 @@ class NSFConfig:
     dropout:     float = 0.1
     activation:  str   = "gelu"
     deriv_min:   float = 1e-3
+    # NSF post-hoc calibration on evaluated grid PDFs (not spline widths).
+    use_grid_temperature_scaling: bool = False
+    disable_spline_width_posthoc_scaling: bool = True
+
+
+@dataclass
+class SbiNpeContextProjectionConfig:
+    enabled:    bool = True
+    hidden_dims: List[int] = field(default_factory=lambda: [128, 64])
+    dropout:    float = 0.0
+    layer_norm: bool = True
+
+
+@dataclass
+class SbiNpeGridEvalConfig:
+    n_grid:     int = 512
+    z_min_eval: float = 0.0
+    z_max_eval: Optional[float] = None
+
+
+@dataclass
+class SbiNpeCalibrationConfig:
+    grid_temperature_scaling: bool = False
+    temperature_grid: List[float] = field(
+        default_factory=lambda: [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4, 1.6, 2.0, 2.5, 3.0]
+    )
+
+
+@dataclass
+class SbiNpeEnsembleConfig:
+    enabled:   bool = False
+    n_members: int = 1
+    seeds:     List[int] = field(default_factory=list)
+
+
+@dataclass
+class SbiNpeConfig:
+    """SBI/NPE conditional density head (requires optional ``sbi`` package)."""
+    density_estimator: str = "nsf"          # nsf | maf | mdn
+    hidden_features:   int = 64
+    num_transforms:    int = 3
+    num_bins:          int = 8
+    context_mode:      str = "frozen_point" # frozen_point | point_only | latent_only | ensemble_summary
+    target_transform:  str = "log1p_logit"  # log1p_logit | log1p | z_logit | z
+    y_min:             float = 0.0
+    y_max:             float = 1.45
+    eps:               float = 1e-5
+    train_stage:       int = 2
+    freeze_encoder:    bool = True
+    include_point_prediction: bool = True
+    include_coverage_summary: bool = True
+    context_dim:       Optional[int] = None
+    context_projection: SbiNpeContextProjectionConfig = field(
+        default_factory=SbiNpeContextProjectionConfig
+    )
+    lr:                Optional[float] = None
+    weight_decay:      Optional[float] = None
+    batch_size:        Optional[int] = None
+    max_epochs:        Optional[int] = None
+    early_stopping_metric: str = "val_nll"
+    ensemble:          SbiNpeEnsembleConfig = field(default_factory=SbiNpeEnsembleConfig)
+    grid_eval:         SbiNpeGridEvalConfig = field(default_factory=SbiNpeGridEvalConfig)
+    calibration:       SbiNpeCalibrationConfig = field(default_factory=SbiNpeCalibrationConfig)
 
 
 @dataclass
 class HeadConfig:
-    type:           str  = "mlp_regressor"   # mlp_regressor | binned_pdf | mdn | nsf
+    type:           str  = "mlp_regressor"   # mlp_regressor | binned_pdf | mdn | nsf | sbi_npe
     mlp_regressor:  MLPRegressorConfig = field(default_factory=MLPRegressorConfig)
     binned_pdf:     BinnedPDFConfig    = field(default_factory=BinnedPDFConfig)
     mdn:            MDNConfig          = field(default_factory=MDNConfig)
     nsf:            NSFConfig          = field(default_factory=NSFConfig)
+    sbi_npe:        SbiNpeConfig       = field(default_factory=SbiNpeConfig)
 
 
 # ------------------------------------------------------------------
@@ -153,26 +226,38 @@ class StageTrainingConfig:
     Per-stage overrides for split training.
     Fields left at None inherit from the top-level training / head / model config.
     """
-    head:                 Optional[str]   = None
-    epochs:               Optional[int]   = None
-    lr:                   Optional[float] = None
-    warmup_epochs:        Optional[int]   = None
-    early_stop_patience:  Optional[int]   = None
-    early_stop_min_epoch: Optional[int]  = None
-    fisher_lambda:        Optional[float] = None
-    spread_lambda:        Optional[float] = None
-    huber_lambda:         Optional[float] = None
-    freeze_encoder:       bool            = False
-    use_coverage:         Optional[bool]  = None   # override model.use_coverage for this stage
+    head:                   Optional[str]   = None
+    epochs:                 Optional[int]   = None
+    lr:                     Optional[float] = None
+    weight_decay:           Optional[float] = None
+    lr_scheduler:           Optional[str]   = None   # cosine | step | none
+    warmup_epochs:          Optional[int]   = None
+    clip_grad_norm:         Optional[float] = None
+    batch_size:             Optional[int]   = None
+    early_stop_patience:    Optional[int]   = None
+    early_stop_min_epoch:   Optional[int]   = None
+    fisher_lambda:          Optional[float] = None
+    spread_lambda:          Optional[float] = None
+    huber_lambda:           Optional[float] = None
+    huber_delta:            Optional[float] = None
+    val_dropout:            Optional[bool]  = None
+    full_filter_epochs:     Optional[int]   = None
+    dropout_resume_lr_mult: Optional[float] = None
+    freeze_encoder:         bool            = False
+    use_coverage:           Optional[bool]  = None   # override model.use_coverage for this stage
 
 
 @dataclass
 class PostHocCalibrationConfig:
-    """Narrow MDN/NSF widths by a single scale factor s ∈ (0, 1]."""
+    """Post-hoc calibration: MDN σ-scale or NSF grid temperature."""
     enabled:    bool  = True
     sigma_min:  float = 0.2
     sigma_max:  float = 1.0
     n_grid:     int   = 80
+    # NSF grid temperature T: log_pdf_cal = log_pdf / T
+    temperature_min: float = 0.5
+    temperature_max: float = 2.0
+    n_grid_pdf: int = 256
 
 
 # ------------------------------------------------------------------
@@ -250,6 +335,8 @@ class TrainingConfig:
     stage2:               StageTrainingConfig = field(
         default_factory=lambda: StageTrainingConfig(freeze_encoder=True, huber_lambda=0.0)
     )
+    # Optional NSF context-sensitivity diagnostic after training.
+    run_nsf_context_diagnostic: bool = False
     post_hoc_calibration: PostHocCalibrationConfig = field(
         default_factory=PostHocCalibrationConfig
     )
@@ -274,10 +361,19 @@ class DataConfig:
     # Predictions and all metrics/plots are always reported in real z.
     log_target:     bool      = False
     # Include per-filter magnitude errors as a 5th token feature.
-    # Requires error columns in the parquet (e.g. mag_u_lsst_err).
-    # If an error column is absent the token receives 0.0 (perfect measurement).
-    # When True, set model.token_dim: 5 in your config.
-    include_errors: bool      = False
+    include_errors: bool = False
+    # SED-like non-detection encoding (default off = legacy drop-NaN behaviour).
+    encode_nondetections: bool = False
+    nondetection_policy: str = "drop"          # drop | keep_token
+    nondetection_mag_fill: float = 30.0
+    nondetection_err_fill: float = 1.0
+    add_detection_flags: bool = False
+    # false: zero-fill missing error cols + warn once (legacy default)
+    # true:  raise ValueError if expected error columns are absent
+    strict_error_columns: bool = False
+    # ── Deprecated aliases (still honoured via resolve_data_options) ──
+    allow_missing_error_cols: bool = False
+    preserve_nondetections: bool = False
 
 
 # ------------------------------------------------------------------
@@ -303,6 +399,7 @@ class BenchmarkConfig:
 class Config:
     run_name:  str      = "run"
     output_dir: str     = "outputs"
+    config_schema_version: str = "1.0"
     data:      DataConfig     = field(default_factory=DataConfig)
     model:     ModelConfig    = field(default_factory=ModelConfig)
     head:      HeadConfig     = field(default_factory=HeadConfig)

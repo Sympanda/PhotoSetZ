@@ -21,7 +21,7 @@ where `m_i` is the normalised AB magnitude, `λ_eff` and `Δλ` are the filter's
 p(z | X_g) = p(z | {m_i, λ_eff_i, Δλ_i}_{i ∈ S_g})
 ```
 
-without requiring a fixed input vector — absent filters are simply not in the set, and non-detections (NaN magnitudes) are masked out per-galaxy at inference time.
+without requiring a fixed input vector — absent filters are simply not in the set. By default, non-detections (NaN magnitudes) are dropped; opt-in SED mode can keep them as flagged tokens (see [SED-like filter handling](#sed-like-filter-handling-opt-in)).
 
 ---
 
@@ -34,7 +34,11 @@ DeepSetZ/
 │   ├── deepsets_nsf.yaml         # DeepSets + Neural Spline Flow head
 │   ├── set_transformer.yaml      # Set Transformer + MLP head
 │   ├── ts1_10yr.yaml             # PZDC Task Set 1, 10-year depth (DeepSets)
-│   ├── ts1_10yr_st.yaml          # TS1 10yr, Set Transformer variant
+│   ├── ts1_10yr_st.yaml          # TS1 10yr, Set Transformer + MDN (end-to-end)
+│   ├── ts1_10yr_st_2part.yaml     # TS1 10yr, two-stage MLP → MDN
+│   ├── ts1_10yr_st_nsf.yaml       # TS1 10yr, Set Transformer + NSF (end-to-end)
+│   ├── ts1_10yr_st_nsf_2part.yaml # TS1 10yr, two-stage MLP → NSF
+│   ├── ts1_10yr_st_nsf_sed.yaml   # TS1 10yr, NSF + SED-like tokens / coverage / bottleneck
 │   ├── ts1_1yr.yaml / ts1_1yr_st.yaml
 │   ├── ts2_10yr.yaml / ts2_10yr_st.yaml   # TS2 (spectroscopic bias)
 │   ├── ts2_1yr.yaml / ts2_1yr_st.yaml
@@ -56,7 +60,8 @@ DeepSetZ/
 │   ├── prepare_data.py        # Build stratified Ellen train/test splits
 │   ├── prepare_pzdc.py        # Build stratified PZDC train/test splits
 │   ├── run_benchmarks.py      # Train flat MLP/MDN baselines for comparison
-│   ├── calibrate_posterior.py # Post-hoc σ scaling on an existing run (no retrain)
+│   ├── calibrate_posterior.py # Post-hoc calibration on an existing run (no retrain)
+│   ├── debug_nsf_conditioning.py  # Verify NSF uses context (log p sensitivity)
 │   ├── export_qp.py           # Export p(z) posteriors to qp HDF5 (submission format)
 │   └── submission.py          # PZDC challenge submission wrapper functions
 ├── src/
@@ -64,8 +69,13 @@ DeepSetZ/
 │   ├── dataset.py          # Parquet → variable-length token sets + collate_fn
 │   ├── config.py           # Dataclass configs + YAML loader/saver
 │   ├── train.py            # Training loop, checkpointing, metrics, plotting
+│   ├── checkpoint_loader.py # Load old/new checkpoints (infers layout from weights)
+│   ├── model_dims.py       # Bottleneck / representation dim helpers
+│   ├── coverage_summary.py # Fixed-size wavelength/coverage summaries (SED mode)
+│   ├── density_context.py  # Optional NSF density-context MLP
+│   ├── data_options.py     # Token schema + legacy config alias resolution
 │   ├── run_artifacts.py    # Checkpoint roles, run discovery, post_hoc.json paths
-│   ├── calibration.py      # Post-hoc σ scaling for MDN / NSF (MACE grid search)
+│   ├── calibration.py      # Post-hoc: MDN σ-scale; NSF grid temperature
 │   ├── training_stages.py  # Split-training stage overrides + encoder freeze/load
 │   ├── platform_fix.py     # macOS OpenMP workaround (auto-imported before torch)
 │   ├── evaluate.py         # Photoz metrics, CDE loss, PIT statistics
@@ -74,6 +84,7 @@ DeepSetZ/
 │   └── models/
 │       ├── deepsets.py         # φ MLP → masked pool → ρ MLP
 │       ├── set_transformer.py  # Token embed → multi-head self-attention → PMA pool
+│       ├── bottleneck.py       # Optional encoder bottleneck MLP (384 → latent)
 │       └── heads/
 │           ├── mlp_regressor.py  # Point estimate, Huber loss
 │           ├── binned_pdf.py     # Softmax over K z-bins, NLL loss
@@ -210,28 +221,54 @@ python src/train.py configs/ts1_10yr.yaml
 # Set Transformer variant
 python src/train.py configs/ts1_10yr_st.yaml
 
+# NSF + SED extension (end-to-end)
+python src/train.py configs/ts1_10yr_st_nsf_sed.yaml --run_name ts1_10yr_nsf_sed_01_st
+
 # Override the run name
 python src/train.py configs/deepsets.yaml --run_name my_experiment
 ```
 
 Checkpoints, a config copy, metrics JSON, and diagnostic plots are all saved to `outputs/<run_name>/`.
 
+**Final evaluation and plots use the best validation checkpoint** (`best_model.pt` / `best_posterior.pt`), not the last-epoch weights in `final_model.pt`. Training logs report `train_nll` / `val_nll` (lower is better).
+
 ### Post-hoc posterior calibration (no retrain)
 
-When an MDN or NSF model has good point estimates but an over-dispersed posterior (n-shaped PIT), you can narrow mixture / spline widths with a single scale factor fitted on the validation split. This writes `calibration/post_hoc.json` into the **existing** run directory — no duplicate checkpoint, no new output folder.
+**MDN:** fit a single σ scale factor on the validation split (MACE grid search).  
+**NSF:** fit **grid temperature** `T` on evaluated PDF grids — spline widths are **not** scaled (invalid geometry).
 
 ```bash
-# Fit σ scale on an existing run (auto-detects best_model.pt or best_posterior.pt)
+# Auto-detect checkpoint role
 python scripts/calibrate_posterior.py outputs/ts1_10yr_08_st
 
-# Explicit checkpoint role (split-training runs)
+# Split-training posterior
 python scripts/calibrate_posterior.py outputs/ts1_10yr_10_st --role posterior
-python scripts/calibrate_posterior.py outputs/ts1_10yr_08_st --role end_to_end
 ```
 
-Post-hoc calibration also runs automatically at the end of training when enabled in config (see [Split training and calibration](#split-training-and-calibration) below).
+Enable in config:
 
-The script also evaluates the **test set** and writes:
+```yaml
+# MDN
+training:
+  post_hoc_calibration:
+    enabled: true
+    sigma_min: 0.2
+    sigma_max: 1.0
+
+# NSF — use grid temperature, not σ-width scaling
+head:
+  nsf:
+    use_grid_temperature_scaling: true
+    disable_spline_width_posthoc_scaling: true
+training:
+  post_hoc_calibration:
+    enabled: true
+    temperature_min: 0.5
+    temperature_max: 2.0
+    n_grid_pdf: 256
+```
+
+Post-hoc also runs at end of training when `post_hoc_calibration.enabled: true`. Writes `calibration/post_hoc.json` into the existing run directory.
 
 | File | Contents |
 |---|---|
@@ -251,7 +288,7 @@ All modes use the same YAML shape; these flags select the pipeline:
 | **Two-stage** | `split_training: true` | `best_point.pt` + `best_posterior.pt` |
 | **Stage 2 only** | `split_training: true` + `stage1_checkpoint: outputs/…/best_point.pt` | copies stage 1 + trains new `best_posterior.pt` |
 
-Post-hoc σ calibration (`post_hoc_calibration.enabled: true`) runs after any mode that ends with an MDN/NSF head.
+Post-hoc calibration (`post_hoc_calibration.enabled: true`) runs after any mode that ends with an MDN/NSF head (MDN: σ scale; NSF: grid temperature).
 
 ### Split training (encoder → point head → posterior head)
 
@@ -267,14 +304,18 @@ Stage 1 writes `best_point.pt`; stage 2 writes `best_posterior.pt`. The interact
 **Stage 2 only** — reuse a finished stage-1 encoder without retraining the MLP:
 
 ```bash
+# MDN two-stage
 python src/train.py configs/ts1_10yr_st_2part.yaml \
   --run_name ts1_10yr_11_st \
   --stage1_checkpoint outputs/ts1_10yr_10_st/best_point.pt
+
+# NSF two-stage (same pipeline; stage 2 head is NSF)
+python src/train.py configs/ts1_10yr_st_nsf_2part.yaml \
+  --run_name ts1_10yr_nsf_2part_01_st \
+  --stage1_checkpoint outputs/ts1_10yr_11_st/best_point.pt
 ```
 
-Or in YAML: `stage1_checkpoint: outputs/ts1_10yr_10_st/best_point.pt` with `split_training: true`.
-
-Accepts `best_point.pt` from a split run, or `best_model.pt` (encoder weights only). Stage-1 metrics/plots are copied into the new run directory when available.
+Both configs share the same structure: stage 1 = MLP point map; stage 2 = `freeze_encoder: true` + PDF head only. Stage-2 `spread_lambda` differs by head (MDN often `5.0`, NSF typically `0.05`–`1.0`).
 
 ### Benchmark baselines
 
@@ -325,13 +366,14 @@ Open the Jupyter notebook for post-training exploration:
 jupyter notebook notebooks/evaluate_interactive.ipynb
 ```
 
-The notebook provides:
+The notebook uses `load_model_from_checkpoint()` so **old runs load correctly** even when saved YAML omits newer fields (e.g. `use_coverage` defaults vs weights on disk).
+
 - **Model selector** — pick from all trained runs in `outputs/` and `benchmarks/` (benchmarks prefixed `[bench]`)
 - **View dropdown** — switch between model roles in the same run directory:
   - *Point (MLP)* — `best_point.pt` (split training only)
   - *Posterior (PDF)* — `best_posterior.pt` (split training only)
   - *End-to-end* — `best_model.pt` (standard training)
-  - *Posterior + post-hoc σ* — same checkpoint as above + `calibration/post_hoc.json` (scales σ at inference; μ unchanged)
+  - *Posterior + post-hoc σ* — same checkpoint as above + `calibration/post_hoc.json` (MDN: scales σ; NSF: grid temperature; μ unchanged)
 - **Filter checkboxes** — select any subset of filters for DeepSetZ models (human-readable names)
 - **Fixed filters for benchmarks** — benchmark runs show their training subset as read-only checkboxes
 - **Point estimate toggle** — switch between mean / median / mode for probabilistic heads
@@ -485,30 +527,112 @@ training:
   #   huber_lambda: 0.0
   #   spread_lambda: 10.0
 
-  # Post-hoc σ scaling (MDN / NSF only) — writes calibration/post_hoc.json
+  # Post-hoc calibration (MDN / NSF) — writes calibration/post_hoc.json
   post_hoc_calibration:
     enabled:    true
-    sigma_min:  0.2    # grid-search lower bound for scale s
-    sigma_max:  1.0    # upper bound (s ≤ 1 narrows posteriors)
+    sigma_min:  0.2       # MDN only
+    sigma_max:  1.0
+    temperature_min: 0.5  # NSF only (with use_grid_temperature_scaling)
+    temperature_max: 2.0
 ```
 
 | Setting | Effect |
 |---|---|
 | `split_training: true` | Stage 1: encoder + MLP → `best_point.pt`. Stage 2: frozen encoder + PDF head → `best_posterior.pt`. |
 | `stage1_checkpoint` | Skip stage 1; load encoder from `best_point.pt` (split run) or `best_model.pt` (encoder only). Copies stage-1 artefacts into the new run dir. |
-| `stage1` / `stage2` | Per-stage overrides for `head`, `epochs`, `lr`, `huber_lambda`, `spread_lambda`, `freeze_encoder`, `use_coverage`, etc. Unset fields inherit from top-level `training` / `head`. |
-| `post_hoc_calibration.enabled` | After training (or via `calibrate_posterior.py`), fit scale `s` on val to minimise MACE; inference uses `σ → s·σ`. |
+| `stage1` / `stage2` | Per-stage overrides — unset fields inherit from top-level `training`. See table below. |
+
+**Per-stage override fields** (`training.stage1` / `training.stage2`):
+
+| Field | Typical stage 1 (MLP) | Typical stage 2 (MDN/NSF) |
+|---|---|---|
+| `head` | `mlp_regressor` | `mdn` / `nsf` |
+| `epochs`, `lr`, `weight_decay`, `warmup_epochs` | Higher LR (e.g. `2e-4`) | Often lower LR (NSF e.g. `8e-6`) |
+| `lr_scheduler`, `clip_grad_norm`, `batch_size` | As needed | As needed |
+| `huber_lambda`, `spread_lambda`, `huber_delta` | Point loss weight | Posterior regularisation |
+| `early_stop_patience`, `early_stop_min_epoch` | Per stage | Per stage |
+| `val_dropout`, `full_filter_epochs`, `dropout_resume_lr_mult` | Optional per stage | Optional per stage |
+| `freeze_encoder` | — | `true` (default in stage 2) |
+| `use_coverage` | Optional | Optional |
+
+```yaml
+training:
+  lr: 2.0e-4              # default for both stages unless overridden
+  weight_decay: 2.0e-4
+  batch_size: 512
+  split_training: true
+  stage1:
+    head: mlp_regressor
+    epochs: 150
+    lr: 2.0e-4
+    warmup_epochs: 25
+    huber_lambda: 0.2
+  stage2:
+    head: nsf
+    epochs: 80
+    lr: 8.0e-6              # NSF needs a much lower LR than the MLP stage
+    weight_decay: 1.0e-4
+    warmup_epochs: 5
+    clip_grad_norm: 0.5
+    freeze_encoder: true
+    spread_lambda: 0.05
+```
+
+Each stage rebuilds its optimiser, scheduler, and dataloaders from the merged config, so stage 2 can use a different batch size or val-dropout setting without affecting stage 1.
+| `post_hoc_calibration.enabled` | After training (or via `calibrate_posterior.py`), fit calibration on val. **MDN:** σ scale. **NSF:** grid temperature (requires `head.nsf.use_grid_temperature_scaling: true`). |
 
 All artefacts share one `outputs/<run_name>/` directory so the notebook can compare views without hunting across folders.
 
-### Coverage conditioning
+### Encoder bottleneck (optional)
 
-Explicitly inform the prediction head how many filters are active:
+Compress pooled encoder features before the head with a 3-layer MLP. **Default `bottleneck: false` leaves behaviour unchanged** (full `embed_dim`, e.g. 384-d, fed to the head).
 
 ```yaml
 model:
-  use_coverage: true   # default true — append n_active/n_available to latent before head
+  bottleneck: false      # default — no bottleneck (backwards compatible)
+  bottleneck: 64          # 384 → … → 64-d latent fed to head / density context
+  bottleneck_dropout: 0.1
 ```
+
+In split training, the bottleneck is trained in stage 1 and **frozen with the encoder** in stage 2. Checkpoints store `bottleneck.*` weights when enabled.
+
+### SED-like filter handling (opt-in)
+
+Extended token schema and NSF conditioning — **all defaults preserve legacy behaviour** (NaN bands dropped, no detection flags, no coverage summaries).
+
+```yaml
+data:
+  encode_nondetections: false       # true + keep_token → NaN bands as flagged tokens
+  nondetection_policy: drop        # drop | keep_token
+  add_detection_flags: false       # +2 token dims: is_detected, is_nondetected
+  strict_error_columns: false        # false: zero-fill missing _err cols + warn once
+
+model:
+  use_coverage_summary: false      # fixed-size wavelength/coverage scalars
+  density_context_branch: false      # separate MLP context path for NSF
+```
+
+Example config: `configs/ts1_10yr_st_nsf_sed.yaml` (NSF end-to-end with non-detection tokens, coverage summaries, density context, bottleneck, grid-T post-hoc).
+
+Debug NSF context usage:
+
+```bash
+python scripts/debug_nsf_conditioning.py outputs/ts1_10yr_nsf_01_st
+python scripts/debug_nsf_conditioning.py --random   # untrained NSF sanity check
+```
+
+Unit tests: `python -m unittest tests.test_sed_extension tests.test_code_fixes -v`
+
+### Coverage conditioning
+
+Legacy scalar (default on many PZDC configs):
+
+```yaml
+model:
+  use_coverage: true   # append n_active / n_total_filters to latent before head
+```
+
+Uses a **fixed denominator** (`n_total_filters` from the dataset registry), not batch max token count — so the same galaxy gets the same coverage feature regardless of batch padding.
 
 Split training can set this per stage:
 
@@ -628,7 +752,7 @@ outputs/<run_name>/
 ├── calibration/
 │   └── post_hoc.json          # Fitted σ scale (val split; no duplicate checkpoint)
 ├── test_metrics_post_hoc.json # Test-set calibration before/after (from calibrate_posterior.py)
-├── final_model.pt             # Checkpoint at end of training
+├── final_model.pt             # Last epoch (debugging); plots/metrics use best_*.pt
 ├── history.json               # End-to-end or stage 2 history
 ├── history_stage1.json        # Split training — stage 1 only
 ├── test_metrics.json          # End-to-end or stage 2 test metrics

@@ -1,0 +1,83 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 1 · NSF end-to-end with SED-like filter / coverage handling
+# Opt-in extension — all legacy configs remain valid with defaults off.
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts1_10yr_nsf_sed_st
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts1_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts1_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+  encode_nondetections: true
+  nondetection_policy: keep_token
+  add_detection_flags: true
+  nondetection_mag_fill: 30.0
+  nondetection_err_fill: 1.0
+  strict_error_columns: false
+
+model:
+  type: set_transformer
+  token_dim: 7          # auto-corrected if mismatched
+  bottleneck: 64        # false = off; int = latent dim (3-layer MLP from encoder)
+  bottleneck_dropout: 0.1
+  use_coverage: false    # legacy scalar; off when using summaries
+  use_coverage_summary: true
+  density_context_branch: true
+  density_context_hidden: [256, 128]
+  density_context_dropout: 0.05
+  set_transformer:
+    embed_dim: 384
+    n_heads: 12
+    n_attn_layers: 4
+    ffn_dim: 1024
+    n_pma_seeds: 1
+    dropout: 0.1
+    pre_embed_hidden: [128, 256]
+
+head:
+  type: nsf
+  nsf:
+    n_bins: 48
+    z_min: 0.0
+    z_max: 1.40
+    hidden_dims: [256, 128, 64]
+    dropout: 0.1
+    activation: gelu
+    deriv_min: 0.001
+    use_grid_temperature_scaling: true
+    disable_spline_width_posthoc_scaling: true
+
+training:
+  batch_size: 512
+  lr: 8.0e-6
+  weight_decay: 1.0e-4
+  epochs: 250
+  lr_scheduler: cosine
+  warmup_epochs: 5
+  clip_grad_norm: 0.5
+  num_workers: 4
+  seed: 42
+  save_best: true
+  early_stop_patience: 25
+  early_stop_min_epoch: 50
+  fisher_lambda: 0.0
+  spread_lambda: 0.05
+  huber_lambda: 0.0
+  val_dropout: true
+  run_nsf_context_diagnostic: true
+  post_hoc_calibration:
+    enabled: true
+    temperature_min: 0.5
+    temperature_max: 2.0
+  dropout:
+    p_complete: 0.40
+    p_preset: 0.20
+    p_survey_drop: 0.20
+    p_aggressive: 0.20
+    min_filters: 3

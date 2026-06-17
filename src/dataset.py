@@ -11,9 +11,15 @@ Each token corresponds to one filter measurement with features:
         x_i = [m_i_norm, log_λ_eff_norm, log_Δλ_norm, survey_id_norm, σ_m_norm]
 
 Non-detections / missing bands are represented as NaN in the parquet.
-Galaxies where ALL filter columns are NaN are excluded.  Per-galaxy NaN
-masks are applied at __getitem__ time so that tokens for missing bands are
-never fed to the network — no imputation needed.
+Galaxies where ALL filter columns are NaN are excluded.
+
+By default (encode_nondetections=false, nondetection_policy=drop), per-galaxy
+NaN bands are dropped at __getitem__ time — non-detection information is not
+passed to the model.
+
+With encode_nondetections=true and nondetection_policy=keep_token, catalogue
+NaNs become observed-but-not-detected tokens (distinct from training dropout,
+which removes tokens to simulate withheld filters).
 
 During training a stratified dropout strategy further augments coverage:
 
@@ -42,6 +48,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .filters import FilterInfo, build_filter_registry
+from .data_options import compute_token_dim
 
 
 # ------------------------------------------------------------------
@@ -56,9 +63,14 @@ LOG_DLAMBDA_SCALE = 0.5
 SURVEY_SCALE      = 3.0    # survey_id in {0,1,2,3} → [0, 1]
 SIGMA_REF         = 0.1    # reference error ~0.1 mag
 SIGMA_SCALE       = 0.5    # σ_norm = (σ - 0.1) / 0.5
+MAG_NONDET        = 30.0   # sentinel magnitude for non-detections (preserve_nondetections)
+SIGMA_NONDET      = 1.0    # large error (mag) for non-detections
 
-TOKEN_DIM_BASE   = 4   # without magnitude errors
-TOKEN_DIM_ERRORS = 5   # with magnitude errors
+TOKEN_DIM_BASE   = 4   # mag + 3 filter metadata features
+TOKEN_DIM_ERRORS = 5   # + sigma
+TOKEN_DIM_FLAGS  = 2   # is_detected + is_nondetected
+
+_WARNED_MISSING_ERRORS = False
 
 
 # ------------------------------------------------------------------
@@ -275,10 +287,16 @@ class GalaxyDataset(Dataset):
     log_target : bool
         Store redshifts as log(1+z).  All evaluation code reverses this.
     include_errors : bool
-        If True, append a normalised σ_m feature to each token, extending
-        token_dim from 4 → 5.  Requires the parquet to contain error columns
-        named ``{col_name}_err``; missing error columns are filled with 0.0
-        (i.e. the "perfect measurement" sentinel).
+    strict_error_columns : bool
+        When False (default), missing error columns are zero-filled with a
+        one-time warning.  When True, raises ValueError.
+    encode_nondetections : bool
+    nondetection_policy : str
+        ``drop`` (legacy) or ``keep_token``.
+    nondetection_mag_fill, nondetection_err_fill : float
+        Sentinels when keep_token policy is active.
+    add_detection_flags : bool
+        Append is_detected / is_nondetected to each token (+2 to token_dim).
     """
 
     def __init__(
@@ -290,10 +308,39 @@ class GalaxyDataset(Dataset):
         active_surveys: Optional[List[str]] = None,
         log_target: bool = False,
         include_errors: bool = False,
+        strict_error_columns: bool = False,
+        encode_nondetections: bool = False,
+        nondetection_policy: str = "drop",
+        nondetection_mag_fill: float = MAG_NONDET,
+        nondetection_err_fill: float = SIGMA_NONDET,
+        add_detection_flags: bool = False,
+        # Deprecated aliases — prefer encode_nondetections / strict_error_columns
+        allow_missing_error_cols: bool = False,
+        preserve_nondetections: bool = False,
     ) -> None:
-        self.dropout_cfg    = dropout_cfg or _NO_DROPOUT
-        self.log_target     = log_target
-        self.include_errors = include_errors
+        if preserve_nondetections:
+            encode_nondetections = True
+            nondetection_policy = "keep_token"
+        if allow_missing_error_cols:
+            strict_error_columns = False
+
+        if nondetection_policy not in ("drop", "keep_token"):
+            raise ValueError(
+                f"nondetection_policy must be 'drop' or 'keep_token', got '{nondetection_policy}'"
+            )
+
+        self.dropout_cfg            = dropout_cfg or _NO_DROPOUT
+        self.log_target             = log_target
+        self.include_errors         = include_errors
+        self.strict_error_columns   = strict_error_columns
+        self.encode_nondetections   = encode_nondetections
+        self.nondetection_policy    = nondetection_policy
+        self.nondetection_mag_fill  = nondetection_mag_fill
+        self.nondetection_err_fill  = nondetection_err_fill
+        self.add_detection_flags    = add_detection_flags
+        self._keep_nondetections    = (
+            encode_nondetections and nondetection_policy == "keep_token"
+        )
 
         # Load catalogue first so we know which columns are available
         df = pd.read_parquet(parquet_path)
@@ -326,7 +373,10 @@ class GalaxyDataset(Dataset):
         # photometric filter is non-NaN.
         valid_z  = df[target_col].notna()
         n_valid  = df[self._col_names].notna().sum(axis=1)
-        valid_ph = n_valid >= 1
+        if self._keep_nondetections:
+            valid_ph = valid_z
+        else:
+            valid_ph = n_valid >= 1
         df = df[valid_z & valid_ph].reset_index(drop=True)
 
         if len(df) == 0:
@@ -347,15 +397,29 @@ class GalaxyDataset(Dataset):
 
         # ── Magnitude errors ─────────────────────────────────────────
         if include_errors:
+            global _WARNED_MISSING_ERRORS
             err_cols = []
+            missing_err_cols = []
             for fi in self.filters:
                 ecol = fi.err_col_name
                 if ecol and ecol in df.columns:
                     err_cols.append(df[ecol].values.astype(np.float32))
                 else:
-                    # No error column → fill with 0.0 (perfect measurement)
+                    missing_err_cols.append((fi.col_name, ecol))
                     err_cols.append(np.zeros(len(df), dtype=np.float32))
-            # shape (n_rows, n_filters)
+            if missing_err_cols:
+                if strict_error_columns:
+                    raise ValueError(
+                        "Missing error columns while include_errors=True "
+                        f"(strict_error_columns=true): {missing_err_cols}"
+                    )
+                if not _WARNED_MISSING_ERRORS:
+                    print(
+                        "  [dataset] WARNING: missing error columns zero-filled "
+                        f"(strict_error_columns=false): {missing_err_cols[:5]}"
+                        + (" …" if len(missing_err_cols) > 5 else "")
+                    )
+                    _WARNED_MISSING_ERRORS = True
             self.errors: Optional[np.ndarray] = np.stack(err_cols, axis=1)
         else:
             self.errors = None
@@ -375,10 +439,23 @@ class GalaxyDataset(Dataset):
         ])  # (n_filters, 3)
 
         # ── Token dimension ───────────────────────────────────────────
-        self.token_dim: int = TOKEN_DIM_ERRORS if include_errors else TOKEN_DIM_BASE
+        self.token_dim: int = compute_token_dim(include_errors, add_detection_flags)
 
-        # ── Dropout engine ────────────────────────────────────────────
         self._dropout = FilterDropout(self.dropout_cfg, self.filters)
+
+        if self._keep_nondetections:
+            print(
+                "  [dataset] encode_nondetections=keep_token — NaN bands kept as "
+                f"tokens (mag={self.nondetection_mag_fill}, "
+                f"σ={self.nondetection_err_fill}"
+                + (", +detection flags" if add_detection_flags else "")
+                + ")."
+            )
+        else:
+            print(
+                "  [dataset] nondetection_policy=drop — NaN magnitude bands "
+                "are dropped; non-detection information is not passed to the model."
+            )
 
     def set_dropout_cfg(self, dropout_cfg: Optional[DropoutConfig]) -> None:
         """Swap dropout strategy at runtime (e.g. curriculum full-filter warmup)."""
@@ -389,26 +466,45 @@ class GalaxyDataset(Dataset):
         return len(self.redshifts)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mags = self.magnitudes[idx]                        # (n_filters,)
+        mags = self.magnitudes[idx]
+        detected = ~np.isnan(mags)
 
-        # Per-galaxy valid mask: True = filter has a measured (non-NaN) value
-        valid = ~np.isnan(mags)
+        if self._keep_nondetections:
+            mag_filled = np.where(detected, mags, self.nondetection_mag_fill).astype(np.float32)
+            mag_norm = ((mag_filled - MAG_REF) / MAG_SCALE).astype(np.float32)
+            valid_for_dropout = np.ones(self.n_filters, dtype=bool)
+            is_detected = detected.astype(np.float32)
+            is_nondetected = (~detected).astype(np.float32)
+        else:
+            mag_norm = np.where(
+                detected, (mags - MAG_REF) / MAG_SCALE, 0.0,
+            ).astype(np.float32)
+            valid_for_dropout = detected
+            is_detected = np.ones(self.n_filters, dtype=np.float32)
+            is_nondetected = np.zeros(self.n_filters, dtype=np.float32)
 
-        # Normalise magnitudes; fill NaN positions with 0 (they'll be masked out)
-        mag_norm = np.where(valid, (mags - MAG_REF) / MAG_SCALE, 0.0).astype(np.float32)
-
-        # (n_filters, token_dim)
-        tokens = np.concatenate([mag_norm[:, None], self._filter_meta], axis=1)
-
+        parts = [mag_norm[:, None], self._filter_meta]
         if self.errors is not None:
-            sigmas    = self.errors[idx]                   # (n_filters,)
-            # Clip to [0, ∞), fill NaN with 0.0 (treated as perfect measurement)
-            sigmas    = np.where(np.isnan(sigmas), 0.0, np.clip(sigmas, 0.0, None))
+            sigmas = self.errors[idx]
+            if self._keep_nondetections:
+                sigmas = np.where(
+                    detected,
+                    np.where(
+                        np.isnan(sigmas), self.nondetection_err_fill,
+                        np.clip(sigmas, 0.0, None),
+                    ),
+                    self.nondetection_err_fill,
+                )
+            else:
+                sigmas = np.where(np.isnan(sigmas), 0.0, np.clip(sigmas, 0.0, None))
             sigma_norm = ((sigmas - SIGMA_REF) / SIGMA_SCALE).astype(np.float32)
-            tokens    = np.concatenate([tokens, sigma_norm[:, None]], axis=1)
+            parts.append(sigma_norm[:, None])
+        if self.add_detection_flags:
+            parts.append(is_detected[:, None])
+            parts.append(is_nondetected[:, None])
 
-        # Combine data validity with training dropout
-        keep   = self._dropout.apply(valid_mask=valid)
+        tokens = np.concatenate(parts, axis=1)
+        keep = self._dropout.apply(valid_mask=valid_for_dropout)
         tokens = tokens[keep]
 
         return (

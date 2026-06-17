@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader, Subset
 
 from src.calibration import compute_mace, run_post_hoc_calibration
 from src.config import load_config
+from src.data_options import dataset_kwargs_from_config
 from src.dataset import GalaxyDataset, collate_fn
 from src.dataloader_utils import resolve_num_workers, shutdown_dataloaders
 from src.evaluate import compute_metrics, compute_pit_metrics
@@ -41,7 +42,8 @@ from src.run_artifacts import (
     checkpoint_path,
     load_post_hoc,
 )
-from src.train import build_model, collect_prob_outputs, get_device, set_seed
+from src.checkpoint_loader import load_model_from_checkpoint
+from src.train import collect_prob_outputs, get_device, set_seed
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,7 +88,7 @@ def _evaluate_test_set(
         dropout_cfg=None,
         active_surveys=cfg.data.active_surveys or None,
         log_target=cfg.data.log_target,
-        include_errors=cfg.data.include_errors,
+        **dataset_kwargs_from_config(cfg.data),
     )
     test_loader = DataLoader(
         test_ds,
@@ -203,7 +205,7 @@ def main() -> None:
         dropout_cfg=None,
         active_surveys=cfg.data.active_surveys or None,
         log_target=cfg.data.log_target,
-        include_errors=cfg.data.include_errors,
+        **dataset_kwargs_from_config(cfg.data),
     )
     n_total = len(train_ds)
     n_val   = max(1, int(0.1 * n_total))
@@ -223,8 +225,10 @@ def main() -> None:
     if role == ROLE_POSTERIOR and cfg.training.split_training:
         head_type = cfg.training.stage2.head or cfg.head.type
 
-    model = build_model(cfg, device=device, head_type=head_type)
-    model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+    model = load_model_from_checkpoint(
+        cfg, ckpt, device=device, head_type=head_type,
+        n_total_filters=train_ds.n_filters,
+    )
     model.eval()
 
     print(f"Run: {run_dir.name}  |  checkpoint: {ckpt.name}  |  head: {head_type}")

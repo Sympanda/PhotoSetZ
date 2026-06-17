@@ -1,0 +1,103 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Task Set 1 · Set Transformer · two-stage MLP → SBI/NPE density head
+# Requires: pip install sbi  (or conda install -c conda-forge sbi)
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_name: ts1_10yr_sbi_npe_st
+output_dir: outputs
+
+data:
+  train_path: data/pzdc/ts1_cardinal_10yr_train.parquet
+  test_path:  data/pzdc/ts1_cardinal_10yr_test.parquet
+  res_dir:    data/ellen
+  target_col: redshift
+  active_surveys: [lsst, roman]
+  log_target: true
+  include_errors: true
+
+model:
+  type: set_transformer
+  token_dim: 5
+  use_coverage: true
+  bottleneck: false
+  set_transformer:
+    embed_dim: 384
+    n_heads: 12
+    n_attn_layers: 4
+    ffn_dim: 1024
+    n_pma_seeds: 1
+    dropout: 0.1
+    pre_embed_hidden: [128, 256]
+
+head:
+  type: sbi_npe
+  mlp_regressor:
+    hidden_dims: [256, 512, 256, 128, 64]
+    dropout: 0.2
+    huber_delta: 0.5
+    activation: leaky_relu
+  sbi_npe:
+    density_estimator: nsf
+    hidden_features: 64
+    num_transforms: 3
+    num_bins: 8
+    context_mode: frozen_point
+    target_transform: log1p_logit
+    y_min: 0.0
+    y_max: 1.45
+    eps: 1.0e-5
+    freeze_encoder: true
+    include_point_prediction: true
+    include_coverage_summary: true
+    context_projection:
+      enabled: true
+      hidden_dims: [128, 64]
+      dropout: 0.0
+      layer_norm: true
+    lr: 3.0e-5
+    weight_decay: 1.0e-5
+    grid_eval:
+      n_grid: 512
+      z_min_eval: 0.0
+    calibration:
+      grid_temperature_scaling: false
+
+training:
+  batch_size: 512
+  lr: 2.0e-4
+  weight_decay: 2.0e-4
+  epochs: 250
+  lr_scheduler: cosine
+  warmup_epochs: 25
+  clip_grad_norm: 1.0
+  num_workers: 4
+  seed: 42
+  save_best: true
+  early_stop_patience: 20
+  fisher_lambda: 0.0
+  spread_lambda: 0.0
+  huber_lambda: 0.2
+  val_dropout: true
+  split_training: true
+  stage1:
+    head: mlp_regressor
+    epochs: 150
+    lr: 2.0e-4
+    huber_lambda: 0.2
+    use_coverage: true
+    early_stop_patience: 20
+  stage2:
+    head: sbi_npe
+    epochs: 200
+    lr: 3.0e-5
+    huber_lambda: 0.0
+    spread_lambda: 0.0
+    freeze_encoder: true
+    use_coverage: true
+    early_stop_patience: 25
+  dropout:
+    p_complete: 0.40
+    p_preset: 0.20
+    p_survey_drop: 0.20
+    p_aggressive: 0.20
+    min_filters: 3

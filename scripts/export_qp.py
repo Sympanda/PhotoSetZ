@@ -10,6 +10,7 @@ Supported head types
   MDN       → qp.Ensemble(qp.mixmod, ...)   — Gaussian mixture
   BinnedPDF → qp.Ensemble(qp.interp, ...)   — interpolated grid
   NSF       → qp.Ensemble(qp.interp, ...)   — evaluated on a dense grid
+  SBI_NPE   → qp.Ensemble(qp.interp, ...)   — evaluated on a dense z-grid
   MLP       → qp.Ensemble(qp.interp, ...)   — approximated as narrow Gaussian
 
 Usage
@@ -43,8 +44,9 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import load_config
+from src.checkpoint_loader import load_model_from_checkpoint
 from src.dataset import GalaxyDataset, collate_fn
-from src.train import build_encoder, build_head, DeepSetZ, get_device
+from src.train import get_device
 
 import qp
 
@@ -182,13 +184,14 @@ def export_qp(
     object_ids = test_ds.object_ids
 
     # ── Build model ───────────────────────────────────────────────────────
-    device  = get_device()
-    encoder = build_encoder(cfg)
-    head    = build_head(cfg, encoder.output_dim)
-    model   = DeepSetZ(encoder, head).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    device = get_device()
+    model  = load_model_from_checkpoint(
+        cfg, ckpt_path, device=device, n_total_filters=test_ds.n_filters,
+    )
     model.eval()
 
+    from src.models.sbi_stage2 import SBIStage2Model
+    head = model.sbi_head if isinstance(model, SBIStage2Model) else model.head
     head_type = head.__class__.__name__
     print(f"  Head type: {head_type}")
     print(f"  Test galaxies: {len(test_ds):,}")
@@ -197,12 +200,16 @@ def export_qp(
     from src.models.heads.mdn        import MDN
     from src.models.heads.binned_pdf import BinnedPDF
     from src.models.heads.nsf        import NeuralSplineFlow
+    from src.models.heads.sbi_npe    import SBINPEHead
 
     all_z_pred, all_pi, all_mu, all_sigma = [], [], [], []
     all_probs, all_widths, all_heights, all_derivs = [], [], [], []
+    all_sbi_pdf = []
 
     for tokens, mask, _ in loader:
-        out = model(tokens.to(device), mask.to(device))
+        tokens_d = tokens.to(device)
+        mask_d   = mask.to(device)
+        out = model(tokens_d, mask_d)
         all_z_pred.append(out["z_pred"].cpu())
         if isinstance(head, MDN):
             all_pi.append(out["pi"].cpu())
@@ -214,6 +221,12 @@ def export_qp(
             all_widths.append(out["widths"].cpu())
             all_heights.append(out["heights"].cpu())
             all_derivs.append(out["derivs"].cpu())
+        elif isinstance(head, SBINPEHead):
+            h = model._encode(tokens_d, mask_d)
+            ctx = model.context_builder(h, tokens_d, mask_d, out["z_pred"])
+            z_grid = head.z_grid(device)
+            _, pdf = head.evaluate_grid(z_grid, ctx)
+            all_sbi_pdf.append(pdf.cpu())
 
     z_pred_raw = torch.cat(all_z_pred).numpy()
 
@@ -261,6 +274,11 @@ def export_qp(
             pdf_rows.append(log_pdf.exp().reshape(B, nsf_grid).numpy())
         pdf_grid = np.vstack(pdf_rows)   # (N, nsf_grid)
         ens = _build_ensemble_grid(pdf_grid, z_grid.numpy(), log_target)
+
+    elif isinstance(head, SBINPEHead):
+        pdf_grid = torch.cat(all_sbi_pdf).numpy()
+        z_grid   = head.z_grid(device).cpu().numpy()
+        ens = _build_ensemble_grid(pdf_grid, z_grid, log_target=False)
 
     else:
         # MLP regressor — approximate as narrow Gaussian

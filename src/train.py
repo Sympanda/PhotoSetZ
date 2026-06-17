@@ -31,6 +31,11 @@ from tqdm import tqdm
 
 from src.config import Config, load_config, save_config
 from src.dataset import GalaxyDataset, DropoutConfig, collate_fn
+from src.data_options import resolve_data_options, dataset_kwargs_from_config, compute_token_dim
+from src.coverage_summary import compute_coverage_summary, COVERAGE_SUMMARY_DIM
+from src.density_context import DensityContextNet
+from src.model_dims import resolve_bottleneck_dim, representation_dim
+from src.models.bottleneck import EncoderBottleneck
 from src.models.deepsets import DeepSets
 from src.models.set_transformer import SetTransformer
 from src.models.heads import HEAD_REGISTRY
@@ -46,12 +51,13 @@ from src.plot import (
 from src.dataloader_utils import resolve_num_workers, shutdown_dataloaders
 from src.calibration import run_post_hoc_calibration
 from src.run_artifacts import (
-    CKPT_END_TO_END, CKPT_POINT, CKPT_POSTERIOR,
+    CKPT_END_TO_END, CKPT_POINT, CKPT_POSTERIOR, CKPT_SBI_NPE,
     ROLE_END_TO_END, ROLE_POSTERIOR,
     post_hoc_sigma_scale,
 )
 from src.training_stages import (
     apply_stage_overrides,
+    format_stage_training_summary,
     freeze_module,
     load_encoder_weights,
     resolve_stage1_checkpoint,
@@ -93,14 +99,43 @@ def build_encoder(cfg: Config) -> nn.Module:
         raise ValueError(f"Unknown model type: {mc.type}")
 
 
-def build_head(cfg: Config, embed_dim: int, head_type: str | None = None) -> nn.Module:
+def _nsf_uses_density_context(cfg: Config, head_type: str | None = None) -> bool:
+    ht = head_type or cfg.head.type
+    if ht != "nsf":
+        return False
+    mc = cfg.model
+    return mc.density_context_branch or mc.use_coverage_summary
+
+
+def _point_head_extra_dim(cfg: Config) -> int:
+    return 1 if cfg.model.use_coverage else 0
+
+
+def _density_context_input_dim(cfg: Config, encoder_dim: int) -> int:
+    d = encoder_dim
+    if cfg.model.use_coverage_summary:
+        d += COVERAGE_SUMMARY_DIM
+    return d
+
+
+def build_head(
+    cfg: Config,
+    embed_dim: int,
+    head_type: str | None = None,
+    *,
+    for_density_context: bool = False,
+) -> nn.Module:
     hc = cfg.head
     head_type = head_type or hc.type
     head_cls = HEAD_REGISTRY[head_type]
 
-    # If coverage conditioning is enabled, the head receives embed_dim + 1
-    # (the extra scalar is n_active / n_available, appended in DeepSetZ.forward)
-    in_dim = embed_dim + 1 if cfg.model.use_coverage else embed_dim
+    if for_density_context and head_type == "nsf":
+        if cfg.model.density_context_branch:
+            in_dim = embed_dim  # output of DensityContextNet
+        else:
+            in_dim = _density_context_input_dim(cfg, embed_dim)
+    else:
+        in_dim = embed_dim + _point_head_extra_dim(cfg)
 
     if head_type == "mlp_regressor":
         c = hc.mlp_regressor
@@ -132,22 +167,66 @@ def build_model(
     cfg: Config,
     device: torch.device | None = None,
     head_type: str | None = None,
+    n_total_filters: int | None = None,
 ) -> DeepSetZ:
     """Build encoder + head with config-consistent input dims and training flags."""
-    if cfg.data.include_errors and cfg.model.token_dim == 4:
+    data_opts = resolve_data_options(cfg.data)
+    expected_td = data_opts.token_dim
+    if cfg.model.token_dim != expected_td:
+        print(
+            f"  [info] auto-setting model.token_dim {cfg.model.token_dim} → {expected_td} "
+            f"(include_errors={data_opts.include_errors}, "
+            f"add_detection_flags={data_opts.add_detection_flags})"
+        )
+        cfg.model.token_dim = expected_td
+    elif cfg.data.include_errors and cfg.model.token_dim == 4:
+        print("  [info] include_errors=True → auto-setting model.token_dim to 5")
         cfg.model.token_dim = 5
 
     encoder = build_encoder(cfg)
-    head    = build_head(cfg, encoder.output_dim, head_type=head_type)
-    tc      = cfg.training
-    model   = DeepSetZ(
+    enc_dim = encoder.output_dim
+    latent_dim = resolve_bottleneck_dim(cfg.model)
+    repr_dim = representation_dim(cfg, enc_dim)
+    ht = head_type or cfg.head.type
+    uses_density = _nsf_uses_density_context(cfg, ht)
+
+    bottleneck = None
+    if latent_dim is not None:
+        bottleneck = EncoderBottleneck(
+            enc_dim, latent_dim, dropout=cfg.model.bottleneck_dropout,
+        )
+        print(f"  Encoder bottleneck: {enc_dim} → {latent_dim} (3-layer MLP)")
+
+    density_context_net = None
+    if uses_density and cfg.model.density_context_branch:
+        ctx_in = _density_context_input_dim(cfg, repr_dim)
+        density_context_net = DensityContextNet(
+            in_dim=ctx_in,
+            out_dim=repr_dim,
+            hidden_dims=cfg.model.density_context_hidden,
+            dropout=cfg.model.density_context_dropout,
+        )
+
+    head = build_head(
+        cfg, repr_dim, head_type=ht,
+        for_density_context=uses_density,
+    )
+    tc = cfg.training
+    model = DeepSetZ(
         encoder,
         head,
-        use_coverage  = cfg.model.use_coverage,
-        fisher_lambda = tc.fisher_lambda,
-        spread_lambda = tc.spread_lambda,
-        huber_lambda  = tc.huber_lambda,
-        huber_delta   = tc.huber_delta,
+        bottleneck=bottleneck,
+        use_coverage=cfg.model.use_coverage,
+        use_coverage_summary=cfg.model.use_coverage_summary,
+        density_context_branch=cfg.model.density_context_branch,
+        density_context_net=density_context_net,
+        n_total_filters=n_total_filters or 1,
+        include_errors=data_opts.include_errors,
+        add_detection_flags=data_opts.add_detection_flags,
+        fisher_lambda=tc.fisher_lambda,
+        spread_lambda=tc.spread_lambda,
+        huber_lambda=tc.huber_lambda,
+        huber_delta=tc.huber_delta,
     )
     if device is not None:
         model = model.to(device)
@@ -165,39 +244,89 @@ class DeepSetZ(nn.Module):
         self,
         encoder: nn.Module,
         head: nn.Module,
+        bottleneck: nn.Module | None = None,
         use_coverage: bool = False,
+        use_coverage_summary: bool = False,
+        density_context_branch: bool = False,
+        density_context_net: nn.Module | None = None,
+        n_total_filters: int = 1,
+        include_errors: bool = False,
+        add_detection_flags: bool = False,
         fisher_lambda: float = 0.0,
         spread_lambda: float = 0.0,
         huber_lambda: float = 0.0,
         huber_delta: float = 0.5,
     ) -> None:
         super().__init__()
-        self.encoder       = encoder
-        self.head          = head
-        self.use_coverage  = use_coverage
-        self.fisher_lambda = fisher_lambda
-        self.spread_lambda = spread_lambda
-        self.huber_lambda  = huber_lambda
-        self.huber_delta   = huber_delta
+        self.encoder                = encoder
+        self.bottleneck             = bottleneck
+        self.head                   = head
+        self.use_coverage          = use_coverage
+        self.use_coverage_summary  = use_coverage_summary
+        self.density_context_branch = density_context_branch
+        self.density_context_net   = density_context_net
+        self.n_total_filters       = max(int(n_total_filters), 1)
+        self.include_errors        = include_errors
+        self.add_detection_flags   = add_detection_flags
+        self.fisher_lambda         = fisher_lambda
+        self.spread_lambda         = spread_lambda
+        self.huber_lambda          = huber_lambda
+        self.huber_delta           = huber_delta
+
+    def _coverage_scalar(self, key_padding_mask: torch.Tensor) -> torch.Tensor:
+        n_active = (~key_padding_mask).float().sum(dim=-1, keepdim=True)
+        return n_active / self.n_total_filters
+
+    def _nsf_density_context(
+        self,
+        h_set: torch.Tensor,
+        tokens: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        parts = [h_set]
+        if self.use_coverage_summary:
+            h_cov = compute_coverage_summary(
+                tokens,
+                key_padding_mask,
+                n_total_filters=self.n_total_filters,
+                include_errors=self.include_errors,
+                add_detection_flags=self.add_detection_flags,
+            )
+            parts.append(h_cov)
+        ctx_in = torch.cat(parts, dim=-1)
+        if self.density_context_branch and self.density_context_net is not None:
+            return self.density_context_net(ctx_in)
+        return ctx_in
 
     def forward(
         self,
-        tokens: torch.Tensor,           # (B, N, token_dim)
-        key_padding_mask: torch.Tensor, # (B, N)  True = padding
+        tokens: torch.Tensor,
+        key_padding_mask: torch.Tensor,
         z_true: torch.Tensor | None = None,
     ) -> dict:
-        embedding = self.encoder(tokens, key_padding_mask)
+        h_set = self.encoder(tokens, key_padding_mask)
+        if self.bottleneck is not None:
+            h_set = self.bottleneck(h_set)
 
-        if self.use_coverage:
-            # n_active = number of real (non-padding) tokens per galaxy
-            n_available = (~key_padding_mask).float().sum(dim=-1, keepdim=True)  # (B, 1)
-            n_total     = (~key_padding_mask).float().sum(dim=-1).max().clamp(min=1)
-            coverage    = n_available / n_total                                   # (B, 1) in (0,1]
-            embedding   = torch.cat([embedding, coverage], dim=-1)
+        from src.models.heads.mlp_regressor import MLPRegressor
+        from src.models.heads.nsf import NeuralSplineFlow
+
+        uses_nsf_density = (
+            isinstance(self.head, NeuralSplineFlow)
+            and (self.density_context_branch or self.use_coverage_summary)
+        )
+
+        if uses_nsf_density:
+            head_embedding = self._nsf_density_context(h_set, tokens, key_padding_mask)
+        else:
+            head_embedding = h_set
+            if self.use_coverage:
+                head_embedding = torch.cat(
+                    [head_embedding, self._coverage_scalar(key_padding_mask)],
+                    dim=-1,
+                )
 
         head_kwargs: dict = {"z_true": z_true}
-        # MLP regressor only accepts (embedding, z_true); prob heads take penalties.
-        from src.models.heads.mlp_regressor import MLPRegressor
         if not isinstance(self.head, MLPRegressor):
             head_kwargs.update(
                 fisher_lambda=self.fisher_lambda,
@@ -205,7 +334,7 @@ class DeepSetZ(nn.Module):
                 huber_lambda=self.huber_lambda,
                 huber_delta=self.huber_delta,
             )
-        return self.head(embedding, **head_kwargs)
+        return self.head(head_embedding, **head_kwargs)
 
 
 # ------------------------------------------------------------------
@@ -309,7 +438,9 @@ def evaluate(
         z_trues = np.expm1(z_trues)
 
     metrics = compute_metrics(z_preds, z_trues)
-    metrics["loss"] = total_loss / max(len(loader), 1)
+    nll = total_loss / max(len(loader), 1)
+    metrics["loss"] = nll   # backward-compatible alias
+    metrics["nll"]  = nll
 
     if return_preds:
         return metrics, z_preds, z_trues
@@ -334,8 +465,15 @@ def collect_prob_outputs(
         z_median  : (N,) median of the predicted distribution
         z_mode    : (N,) mode  of the predicted distribution
         pit       : (N,) Probability Integral Transform values ∈ [0, 1]
-        head_type : str  ("MDN" or "BinnedPDF")
+        head_type : str  ("MDN", "BinnedPDF", "NSF", or "SBI_NPE")
     """
+    from src.models.sbi_stage2 import SBIStage2Model
+    if isinstance(model, SBIStage2Model):
+        from src.sbi_training import collect_sbi_prob_outputs
+        return collect_sbi_prob_outputs(
+            model, loader, device, log_target=log_target, temperature=sigma_scale,
+        )
+
     from src.models.heads.mdn        import MDN
     from src.models.heads.binned_pdf import BinnedPDF
     from src.models.heads.nsf        import NeuralSplineFlow
@@ -398,7 +536,13 @@ def collect_prob_outputs(
         heights = torch.cat(all_heights)
         derivs  = torch.cat(all_derivs)
         ests    = head.point_estimates_from_params(widths, heights, derivs)
-        pit     = head.pit_values(widths, heights, derivs, z_true_raw).numpy()
+        from src.calibration import pit_nsf_temperature
+        if sigma_scale != 1.0:
+            pit = pit_nsf_temperature(
+                head, widths, heights, derivs, z_true_raw, temperature=sigma_scale,
+            )
+        else:
+            pit = head.pit_values(widths, heights, derivs, z_true_raw).numpy()
 
     def _to_real(t: torch.Tensor) -> np.ndarray:
         return np.expm1(t.numpy()) if log_target else t.numpy()
@@ -447,57 +591,46 @@ def train(cfg: Config) -> None:
     )
     active         = cfg.data.active_surveys or None
     log_target     = cfg.data.log_target
-    include_errors = cfg.data.include_errors
-
-    # Auto-update token_dim if include_errors is set but user forgot to change it
-    if include_errors and cfg.model.token_dim == 4:
-        print("  [info] include_errors=True → auto-setting model.token_dim to 5")
-        cfg.model.token_dim = 5
+    data_kw = dataset_kwargs_from_config(cfg.data)
 
     train_ds = GalaxyDataset(
-        parquet_path   = train_path,
-        res_dir        = res_dir,
-        target_col     = cfg.data.target_col,
-        dropout_cfg    = train_dropout,
-        active_surveys = active,
-        log_target     = log_target,
-        include_errors = include_errors,
+        parquet_path=train_path,
+        res_dir=res_dir,
+        target_col=cfg.data.target_col,
+        dropout_cfg=train_dropout,
+        active_surveys=active,
+        log_target=log_target,
+        **data_kw,
     )
     test_ds = GalaxyDataset(
-        parquet_path   = test_path,
-        res_dir        = res_dir,
-        target_col     = cfg.data.target_col,
-        dropout_cfg    = None,
-        active_surveys = active,
-        log_target     = log_target,
-        include_errors = include_errors,
+        parquet_path=test_path,
+        res_dir=res_dir,
+        target_col=cfg.data.target_col,
+        dropout_cfg=None,
+        active_surveys=active,
+        log_target=log_target,
+        **data_kw,
     )
 
-    # Clean val dataset (no dropout) — used for early stopping
     val_ds_full = GalaxyDataset(
-        parquet_path   = train_path,
-        res_dir        = res_dir,
-        target_col     = cfg.data.target_col,
-        dropout_cfg    = None,
-        active_surveys = active,
-        log_target     = log_target,
-        include_errors = include_errors,
+        parquet_path=train_path,
+        res_dir=res_dir,
+        target_col=cfg.data.target_col,
+        dropout_cfg=None,
+        active_surveys=active,
+        log_target=log_target,
+        **data_kw,
     )
 
-    # Val dataset WITH dropout — same dropout config as training.
-    # Evaluated in a second pass each epoch when val_dropout=True.
-    # The dropout seed is fixed per epoch (seed + epoch) so the signal is
-    # stable and comparable across epochs, while still covering the full
-    # distribution of filter-subset conditions over the training run.
     val_ds_drop = GalaxyDataset(
-        parquet_path   = train_path,
-        res_dir        = res_dir,
-        target_col     = cfg.data.target_col,
-        dropout_cfg    = cfg.training.dropout,
-        active_surveys = active,
-        log_target     = log_target,
-        include_errors = include_errors,
-    ) if cfg.training.val_dropout else None
+        parquet_path=train_path,
+        res_dir=res_dir,
+        target_col=cfg.data.target_col,
+        dropout_cfg=cfg.training.dropout,
+        active_surveys=active,
+        log_target=log_target,
+        **data_kw,
+    )
 
     # Deterministic 90/10 index split
     n_total = len(train_ds)
@@ -510,30 +643,11 @@ def train(cfg: Config) -> None:
     from torch.utils.data import Subset
     train_sub    = Subset(train_ds,     train_idx)
     val_sub_full = Subset(val_ds_full,  val_idx)
-    val_sub_drop = Subset(val_ds_drop,  val_idx) if val_ds_drop is not None else None
+    val_sub_drop = Subset(val_ds_drop,  val_idx)
 
     tc = cfg.training
-    nw  = resolve_num_workers(tc.num_workers)
-    pin = device.type == "cuda"
-    train_loader = DataLoader(
-        train_sub, batch_size=tc.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=nw, pin_memory=pin,
-    )
-    val_loader = DataLoader(
-        val_sub_full, batch_size=tc.batch_size * 2, shuffle=False,
-        collate_fn=collate_fn, num_workers=nw,
-    )
-    val_loader_drop = DataLoader(
-        val_sub_drop, batch_size=tc.batch_size * 2, shuffle=False,
-        collate_fn=collate_fn, num_workers=nw,
-    ) if val_sub_drop is not None else None
-    test_loader = DataLoader(
-        test_ds, batch_size=tc.batch_size * 2, shuffle=False,
-        collate_fn=collate_fn, num_workers=nw,
-    )
-
     print(f"  Train: {n_train:,}  Val: {n_val:,}  Test: {len(test_ds):,}")
-    if val_loader_drop:
+    if tc.val_dropout:
         print(f"  Val dropout: enabled  |  fisher_λ={tc.fisher_lambda}  spread_λ={tc.spread_lambda}")
     print(f"  Filters in registry: {train_ds.n_filters}")
 
@@ -551,22 +665,55 @@ def train(cfg: Config) -> None:
 
     if tc.stage1_checkpoint and not tc.split_training:
         raise ValueError("stage1_checkpoint requires split_training: true")
+    if _is_sbi_head(cfg.head.type) and not tc.split_training:
+        raise ValueError(
+            "head.type: sbi_npe requires split_training: true (stage 1 MLP → stage 2 SBI/NPE)."
+        )
 
-    try:
-        if tc.split_training:
-            _train_split_pipeline(
-                cfg, tc, device, log_target, out_dir,
-                train_loader, val_loader, val_loader_drop, test_loader,
-                train_ds, test_ds, train_dropout,
-            )
-        else:
+    if tc.split_training:
+        _train_split_pipeline(
+            cfg, tc, device, log_target, out_dir,
+            train_sub, val_sub_full, val_sub_drop,
+            train_ds, test_ds, train_dropout,
+        )
+    else:
+        train_loader, val_loader, val_loader_drop, test_loader = _build_dataloaders(
+            tc, device, train_sub, val_sub_full, val_sub_drop, test_ds,
+        )
+        try:
             _train_end_to_end(
                 cfg, tc, device, log_target, out_dir,
                 train_loader, val_loader, val_loader_drop, test_loader,
                 train_ds, test_ds, train_dropout,
             )
-    finally:
-        shutdown_dataloaders(train_loader, val_loader, val_loader_drop, test_loader)
+        finally:
+            shutdown_dataloaders(train_loader, val_loader, val_loader_drop, test_loader)
+
+
+def _build_dataloaders(tc, device, train_sub, val_sub_full, val_sub_drop, test_ds):
+    """Build train/val/test loaders from stage-effective training config."""
+    nw  = resolve_num_workers(tc.num_workers)
+    pin = device.type == "cuda"
+    bs  = tc.batch_size
+    train_loader = DataLoader(
+        train_sub, batch_size=bs, shuffle=True,
+        collate_fn=collate_fn, num_workers=nw, pin_memory=pin,
+    )
+    val_loader = DataLoader(
+        val_sub_full, batch_size=bs * 2, shuffle=False,
+        collate_fn=collate_fn, num_workers=nw,
+    )
+    val_loader_drop = None
+    if tc.val_dropout:
+        val_loader_drop = DataLoader(
+            val_sub_drop, batch_size=bs * 2, shuffle=False,
+            collate_fn=collate_fn, num_workers=nw,
+        )
+    test_loader = DataLoader(
+        test_ds, batch_size=bs * 2, shuffle=False,
+        collate_fn=collate_fn, num_workers=nw,
+    )
+    return train_loader, val_loader, val_loader_drop, test_loader
 
 
 def _make_optimiser_and_scheduler(model: DeepSetZ, tc):
@@ -585,7 +732,11 @@ def _make_optimiser_and_scheduler(model: DeepSetZ, tc):
 
 
 def _is_prob_head(head_type: str) -> bool:
-    return head_type in ("mdn", "nsf", "binned_pdf")
+    return head_type in ("mdn", "nsf", "binned_pdf", "sbi_npe")
+
+
+def _is_sbi_head(head_type: str) -> bool:
+    return head_type == "sbi_npe"
 
 
 def _train_end_to_end(
@@ -594,7 +745,7 @@ def _train_end_to_end(
     train_ds, test_ds, train_dropout,
 ) -> None:
     print("\nBuilding model …")
-    model = build_model(cfg, device=device)
+    model = build_model(cfg, device=device, n_total_filters=train_ds.n_filters)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Mode: end-to-end  |  Encoder: {cfg.model.type}  |  Head: {cfg.head.type}")
     print(f"  Parameters: {n_params:,}  |  Device: {device}")
@@ -621,7 +772,7 @@ def _train_end_to_end(
 
 def _train_split_pipeline(
     cfg, tc, device, log_target, out_dir,
-    train_loader, val_loader, val_loader_drop, test_loader,
+    train_sub, val_sub_full, val_sub_drop,
     train_ds, test_ds, train_dropout,
 ) -> None:
     """Stage 1: encoder + MLP.  Stage 2: frozen encoder + PDF head."""
@@ -638,72 +789,116 @@ def _train_split_pipeline(
         cfg1 = apply_stage_overrides(cfg, tc.stage1, default_head="mlp_regressor")
         tc1  = cfg1.training
         print("\nBuilding stage-1 model (encoder + point head) …")
-        model1 = build_model(cfg1, device=device, head_type=cfg1.head.type)
+        model1 = build_model(
+            cfg1, device=device, head_type=cfg1.head.type,
+            n_total_filters=train_ds.n_filters,
+        )
         n1 = sum(p.numel() for p in model1.parameters() if p.requires_grad)
-        enc_dim = model1.encoder.output_dim
-        head_in = enc_dim + 1 if cfg1.model.use_coverage else enc_dim
+        repr_dim = representation_dim(cfg1, model1.encoder.output_dim)
+        head_in = repr_dim + 1 if cfg1.model.use_coverage else repr_dim
         cov = "on (latent+1)" if cfg1.model.use_coverage else "off"
-        print(f"  Head: {cfg1.head.type}  |  Trainable params: {n1:,}  |  coverage: {cov}  |  head in: {head_in}")
+        bn = f"  bottleneck: {repr_dim}d" if model1.bottleneck is not None else ""
+        print(f"  Head: {cfg1.head.type}  |  Trainable params: {n1:,}  |  coverage: {cov}  |  head in: {head_in}{bn}")
+        print(f"  {format_stage_training_summary(tc1)}")
 
         opt1, sched1 = _make_optimiser_and_scheduler(model1, tc1)
+        train_loader, val_loader, val_loader_drop, test_loader = _build_dataloaders(
+            tc1, device, train_sub, val_sub_full, val_sub_drop, test_ds,
+        )
         print(f"\n{'='*65}")
         print(f"  Stage 1 — point  ({cfg.run_name})  for {tc1.epochs} epochs")
         print(f"{'='*65}\n")
 
-        _run_training_loop(
-            model1, train_loader, val_loader, val_loader_drop, test_loader,
-            opt1, sched1, device, cfg1, tc1, log_target, out_dir,
-            train_ds, test_ds, train_dropout,
-            best_ckpt_name=CKPT_POINT,
-            history_name="history_stage1.json",
-            test_metrics_name="test_metrics_point.json",
-            subset_metrics_name="subset_metrics_stage1.json",
-            predictions_name="predictions_stage1.npz",
-            plots_subdir="stage1",
-            stage_label="Stage 1 — Point (MLP)",
-            run_post_hoc=False,
-            stage_title="[stage 1] ",
-        )
+        try:
+            _run_training_loop(
+                model1, train_loader, val_loader, val_loader_drop, test_loader,
+                opt1, sched1, device, cfg1, tc1, log_target, out_dir,
+                train_ds, test_ds, train_dropout,
+                best_ckpt_name=CKPT_POINT,
+                history_name="history_stage1.json",
+                test_metrics_name="test_metrics_point.json",
+                subset_metrics_name="subset_metrics_stage1.json",
+                predictions_name="predictions_stage1.npz",
+                plots_subdir="stage1",
+                stage_label="Stage 1 — Point (MLP)",
+                run_post_hoc=False,
+                stage_title="[stage 1] ",
+            )
+        finally:
+            shutdown_dataloaders(train_loader, val_loader, val_loader_drop, test_loader)
         stage1_ckpt = out_dir / CKPT_POINT
 
     # ── Stage 2: posterior on frozen encoder ─────────────────────────
     cfg2 = apply_stage_overrides(cfg, tc.stage2, default_head=posterior_head)
     tc2  = cfg2.training
-    print("\nBuilding stage-2 model (encoder + posterior head) …")
-    model2 = build_model(cfg2, device=device, head_type=cfg2.head.type)
-    load_encoder_weights(model2, stage1_ckpt)
-    if tc.stage2.freeze_encoder:
-        freeze_module(model2.encoder)
-        print(f"  Encoder: frozen (loaded from {stage1_ckpt.name})")
-    else:
-        print(f"  Encoder: loaded from {stage1_ckpt.name} (trainable)")
-    n2 = sum(p.numel() for p in model2.parameters() if p.requires_grad)
-    enc_dim = model2.encoder.output_dim
-    head_in = enc_dim + 1 if cfg2.model.use_coverage else enc_dim
-    cov = "on (latent+1)" if cfg2.model.use_coverage else "off"
-    print(f"  Head: {cfg2.head.type}  |  Trainable params: {n2:,}  |  coverage: {cov}  |  head in: {head_in}")
+    stage2_is_sbi = _is_sbi_head(cfg2.head.type)
 
-    opt2, sched2 = _make_optimiser_and_scheduler(model2, tc2)
+    if stage2_is_sbi:
+        from src.sbi_training import build_sbi_stage2_model, load_stage1_state_dict, sbi_stage2_optimizer
+        print("\nBuilding stage-2 model (frozen compressor + SBI/NPE) …")
+        stage1_state = load_stage1_state_dict(stage1_ckpt)
+        model2 = build_sbi_stage2_model(
+            cfg2, device, train_ds.n_filters, stage1_state=stage1_state,
+        )
+        n2 = sum(p.numel() for p in model2.trainable_parameters())
+        print(f"  Head: sbi_npe  |  Trainable params: {n2:,}  |  context: {cfg2.head.sbi_npe.context_mode}")
+        print(f"  {format_stage_training_summary(tc2)}")
+        opt2 = sbi_stage2_optimizer(model2, cfg2)
+        sched2 = CosineAnnealingLR(opt2, T_max=max(tc2.epochs - tc2.warmup_epochs, 1))
+        best_ckpt = CKPT_SBI_NPE
+    else:
+        print("\nBuilding stage-2 model (encoder + posterior head) …")
+        model2 = build_model(
+            cfg2, device=device, head_type=cfg2.head.type,
+            n_total_filters=train_ds.n_filters,
+        )
+        load_encoder_weights(model2, stage1_ckpt)
+        if tc.stage2.freeze_encoder:
+            freeze_module(model2.encoder)
+            if model2.bottleneck is not None:
+                freeze_module(model2.bottleneck)
+            print(f"  Encoder: frozen (loaded from {stage1_ckpt.name})"
+                  + (" + bottleneck" if model2.bottleneck is not None else ""))
+        else:
+            print(f"  Encoder: loaded from {stage1_ckpt.name} (trainable)")
+        n2 = sum(p.numel() for p in model2.parameters() if p.requires_grad)
+        repr_dim = representation_dim(cfg2, model2.encoder.output_dim)
+        head_in = repr_dim + 1 if cfg2.model.use_coverage else repr_dim
+        cov = "on (latent+1)" if cfg2.model.use_coverage else "off"
+        bn = f"  bottleneck: {repr_dim}d" if model2.bottleneck is not None else ""
+        print(f"  Head: {cfg2.head.type}  |  Trainable params: {n2:,}  |  coverage: {cov}  |  head in: {head_in}{bn}")
+        print(f"  {format_stage_training_summary(tc2)}")
+        opt2, sched2 = _make_optimiser_and_scheduler(model2, tc2)
+        best_ckpt = CKPT_POSTERIOR
+
+    train_loader, val_loader, val_loader_drop, test_loader = _build_dataloaders(
+        tc2, device, train_sub, val_sub_full, val_sub_drop, test_ds,
+    )
     print(f"\n{'='*65}")
     print(f"  Stage 2 — posterior  ({cfg.run_name})  for {tc2.epochs} epochs")
     print(f"{'='*65}\n")
 
-    _run_training_loop(
-        model2, train_loader, val_loader, val_loader_drop, test_loader,
-        opt2, sched2, device, cfg2, tc2, log_target, out_dir,
-        train_ds, test_ds, train_dropout,
-        best_ckpt_name=CKPT_POSTERIOR,
-        history_name="history.json",
-        test_metrics_name="test_metrics_posterior.json",
-        subset_metrics_name="subset_metrics_posterior.json",
-        predictions_name="predictions_posterior.npz",
-        plots_subdir="stage2",
-        stage_label="Stage 2 — Posterior",
-        run_post_hoc=_is_prob_head(cfg2.head.type),
-        post_hoc_role=ROLE_POSTERIOR,
-        post_hoc_final_plots=True,
-        stage_title="[stage 2] ",
-    )
+    try:
+        _run_training_loop(
+            model2, train_loader, val_loader, val_loader_drop, test_loader,
+            opt2, sched2, device, cfg2, tc2, log_target, out_dir,
+            train_ds, test_ds, train_dropout,
+            best_ckpt_name=best_ckpt,
+            history_name="history.json",
+            test_metrics_name="test_metrics_posterior.json",
+            subset_metrics_name="subset_metrics_posterior.json",
+            predictions_name="predictions_posterior.npz",
+            plots_subdir="stage2",
+            stage_label="Stage 2 — Posterior (SBI/NPE)" if stage2_is_sbi else "Stage 2 — Posterior",
+            run_post_hoc=_is_prob_head(cfg2.head.type) and (
+                not stage2_is_sbi or cfg2.head.sbi_npe.calibration.grid_temperature_scaling
+            ),
+            post_hoc_role=ROLE_POSTERIOR,
+            post_hoc_final_plots=True,
+            stage_title="[stage 2] ",
+        )
+    finally:
+        shutdown_dataloaders(train_loader, val_loader, val_loader_drop, test_loader)
 
 
 def _generate_post_hoc_final_plots(
@@ -758,6 +953,92 @@ def _generate_post_hoc_final_plots(
     print("  Done.\n")
 
 
+def _run_nsf_context_diagnostic(model: DeepSetZ, loader: DataLoader, device: torch.device) -> None:
+    """Verify NSF log_prob changes when conditioning context changes."""
+    from src.models.heads.nsf import NeuralSplineFlow, _rqs_forward
+
+    if not isinstance(model.head, NeuralSplineFlow):
+        return
+    head = model.head
+    model.eval()
+    contexts, z_list = [], []
+    with torch.no_grad():
+        for tokens, mask, z_true in loader:
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            h_set = model.encoder(tokens, mask)
+            if model.bottleneck is not None:
+                h_set = model.bottleneck(h_set)
+            if model.density_context_branch or model.use_coverage_summary:
+                ctx = model._nsf_density_context(h_set, tokens, mask)
+            elif model.use_coverage:
+                ctx = torch.cat([h_set, model._coverage_scalar(mask)], dim=-1)
+            else:
+                ctx = h_set
+            contexts.append(ctx)
+            z_list.append(z_true.to(device))
+            if sum(c.size(0) for c in contexts) >= 64:
+                break
+    h = torch.cat(contexts, dim=0)[:64]
+    y = torch.cat(z_list, dim=0)[:64]
+    if h.size(0) < 32:
+        print("  [nsf-diag] Skipped — fewer than 32 validation samples.")
+        return
+    w1, ht1, d1 = head._spline_params(h[:32])
+    w2, ht2, d2 = head._spline_params(h[32:64])
+    same_y = y[:32]
+    _, lp1 = _rqs_forward(same_y, w1, ht1, d1, head.z_min, head.z_max)
+    _, lp2 = _rqs_forward(same_y, w2, ht2, d2, head.z_min, head.z_max)
+    diff = (lp1 - lp2).abs().mean().item()
+    print(f"\n  [nsf-diag] context sensitivity |log p diff|: {diff:.6f}")
+    if diff < 1e-5:
+        print("  [nsf-diag] WARNING: NSF appears insensitive to context.")
+
+
+def _load_best_checkpoint_for_eval(
+    model: DeepSetZ,
+    out_dir: Path,
+    device: torch.device,
+    best_ckpt_name: str,
+    save_best: bool,
+) -> Path | None:
+    """Reload the best validation checkpoint before final test evaluation."""
+    if not save_best:
+        print("\nEvaluating final in-memory model (save_best=False).")
+        return None
+
+    candidate_paths = [
+        out_dir / best_ckpt_name,
+        out_dir / CKPT_SBI_NPE,
+        out_dir / CKPT_POSTERIOR,
+        out_dir / CKPT_END_TO_END,
+    ]
+    seen: set[Path] = set()
+    best_path = None
+    for p in candidate_paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.exists():
+            best_path = p
+            break
+
+    if best_path is not None:
+        try:
+            state = torch.load(best_path, map_location=device, weights_only=True)
+        except Exception:
+            state = torch.load(best_path, map_location=device, weights_only=False)
+        model.load_state_dict(state)
+        print(f"\nLoaded best checkpoint for final evaluation: {best_path.name}")
+        return best_path
+
+    print(
+        "\nWARNING: save_best=True but no best checkpoint found; "
+        "evaluating final in-memory model."
+    )
+    return None
+
+
 def _run_training_loop(
     model, train_loader, val_loader, val_loader_drop, test_loader,
     optimiser, scheduler, device, cfg, tc, log_target, out_dir,
@@ -801,19 +1082,27 @@ def _run_training_loop(
         # Warmup: linearly scale LR from 0 to target
         if epoch <= tc.warmup_epochs:
             lr = tc.lr * (epoch / max(tc.warmup_epochs, 1))
-            if epoch == tc.full_filter_epochs + 1 and tc.dropout_resume_lr_mult != 1.0:
+            if (
+                tc.full_filter_epochs > 0
+                and epoch == tc.full_filter_epochs + 1
+                and tc.dropout_resume_lr_mult != 1.0
+            ):
                 lr *= tc.dropout_resume_lr_mult
                 print(
-                    f"  [curriculum] Dropout resumed — LR × {tc.dropout_resume_lr_mult:.2f} "
+                    f"  [filter-dropout] Dropout resumed — LR × {tc.dropout_resume_lr_mult:.2f} "
                     f"→ {lr:.2e}"
                 )
             for pg in optimiser.param_groups:
                 pg["lr"] = lr
-        elif epoch == tc.full_filter_epochs + 1 and tc.dropout_resume_lr_mult != 1.0:
+        elif (
+            tc.full_filter_epochs > 0
+            and epoch == tc.full_filter_epochs + 1
+            and tc.dropout_resume_lr_mult != 1.0
+        ):
             for pg in optimiser.param_groups:
                 pg["lr"] *= tc.dropout_resume_lr_mult
             print(
-                f"  [curriculum] Dropout resumed — LR × {tc.dropout_resume_lr_mult:.2f} "
+                f"  [filter-dropout] Dropout resumed — LR × {tc.dropout_resume_lr_mult:.2f} "
                 f"→ {optimiser.param_groups[0]['lr']:.2e}"
             )
 
@@ -825,13 +1114,14 @@ def _run_training_loop(
             scheduler.step()
 
         current_lr = optimiser.param_groups[0]["lr"]
-        row: dict = {"epoch": epoch, "train_loss": train_loss, "lr": current_lr}
+        row: dict = {"epoch": epoch, "train_nll": train_loss, "train_loss": train_loss, "lr": current_lr}
 
         if epoch % tc.val_every == 0:
             # Pass 1: clean val (no dropout) — used for early stopping
             val_metrics = evaluate(model, val_loader, device, desc="validating",
                                    log_target=log_target)
             row.update({f"val_{k}": v for k, v in val_metrics.items()})
+            row["val_nll"] = val_metrics["nll"]
 
             # Pass 2: val with dropout — same conditions as training
             # Seed is fixed per epoch for a stable, comparable signal
@@ -841,23 +1131,26 @@ def _run_training_loop(
                                         desc="val(drop)", log_target=log_target)
                 torch.manual_seed(tc.seed + epoch)  # reset for training reproducibility
                 row.update({f"val_drop_{k}": v for k, v in drop_metrics.items()})
-                drop_str = f"  val_drop={drop_metrics['loss']:.4f}"
+                row["val_drop_nll"] = drop_metrics["nll"]
+                drop_str = f"  val_drop_nll={drop_metrics['nll']:.4f}"
             else:
                 drop_str = ""
 
-            improved = val_metrics["loss"] < best_val_loss
-            in_curriculum = epoch <= early_stop_min_epoch
+            improved = val_metrics["nll"] < best_val_loss
+            in_min_epoch_phase = (
+                early_stop_min_epoch > 0 and epoch <= early_stop_min_epoch
+            )
             if improved:
                 flag = " ✓ best"
-            elif in_curriculum:
-                flag = " [curriculum — no early stop]"
+            elif in_min_epoch_phase:
+                flag = f" [early-stop disabled until epoch {early_stop_min_epoch}]"
             else:
                 flag = f" (patience {patience_counter+1}/{tc.early_stop_patience})"
 
             print(
                 f"{stage_title}Epoch {epoch:03d}/{tc.epochs}  "
-                f"train={train_loss:.4f}  "
-                f"val={val_metrics['loss']:.4f}"
+                f"train_nll={train_loss:.4f}  "
+                f"val_nll={val_metrics['nll']:.4f}"
                 f"{drop_str}  "
                 f"σ_NMAD={val_metrics['sigma_nmad']:.4f}  "
                 f"bias={val_metrics['bias']:+.4f}  "
@@ -868,7 +1161,7 @@ def _run_training_loop(
             )
 
             if improved:
-                best_val_loss = val_metrics["loss"]
+                best_val_loss = val_metrics["nll"]
                 patience_counter = 0
                 if tc.save_best:
                     torch.save(model.state_dict(), out_dir / best_ckpt_name)
@@ -885,8 +1178,16 @@ def _run_training_loop(
 
         history.append(row)
 
-    # Final checkpoint
+    # Final checkpoint (last epoch weights — kept for debugging)
     torch.save(model.state_dict(), out_dir / "final_model.pt")
+
+    # Reload best validation weights before test evaluation and plots
+    _load_best_checkpoint_for_eval(
+        model, out_dir, device, best_ckpt_name, tc.save_best,
+    )
+
+    if tc.run_nsf_context_diagnostic:
+        _run_nsf_context_diagnostic(model, val_loader, device)
 
     # ── Test-set evaluation ─────────────────────────────────────────
     print(f"\n{'='*65}")

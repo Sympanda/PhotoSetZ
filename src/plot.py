@@ -58,9 +58,9 @@ _COMBO_CMAP = plt.cm.viridis
 
 def plot_training_curves(history: List[dict], out_dir: Path) -> None:
     epochs        = [r["epoch"]                  for r in history]
-    train_loss    = [r.get("train_loss",   np.nan) for r in history]
-    val_loss      = [r.get("val_loss",     np.nan) for r in history]
-    val_drop_loss = [r.get("val_drop_loss",np.nan) for r in history]
+    train_loss    = [r.get("train_nll", r.get("train_loss", np.nan)) for r in history]
+    val_loss      = [r.get("val_nll",   r.get("val_loss",   np.nan)) for r in history]
+    val_drop_loss = [r.get("val_drop_nll", r.get("val_drop_loss", np.nan)) for r in history]
     sigma_nmad    = [r.get("val_sigma_nmad", np.nan) for r in history]
     bias          = [r.get("val_bias",     np.nan) for r in history]
     outlier       = [r.get("val_outlier_rate", np.nan) for r in history]
@@ -86,7 +86,7 @@ def plot_training_curves(history: List[dict], out_dir: Path) -> None:
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    _plot(axes[0, 0], train_loss, val_loss, "Loss", "Loss", logy=True,
+    _plot(axes[0, 0], train_loss, val_loss, "NLL", "NLL (lower is better)", logy=True,
           y_val2=val_drop_loss if has_drop else None, val2_label="val (dropout)")
     _plot(axes[0, 1], sigma_nmad, None,     "σ_NMAD",       "σ_NMAD")
     axes[0, 1].plot(epochs, sigma_nmad, color="#E2734C", lw=1.5)

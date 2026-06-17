@@ -228,9 +228,8 @@ class MDN(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         pi, mu, sigma = self._params(embedding)  # each (B, C)
 
-        # Primary point estimate: mean of the dominant component
-        best_c = pi.argmax(dim=-1)               # (B,)
-        z_pred = mu.gather(1, best_c.unsqueeze(1)).squeeze(1)  # (B,)
+        # Primary point estimate: mixture mean Σ_c π_c μ_c (matches Huber aux + metrics)
+        z_pred = (pi * mu).sum(dim=-1)  # (B,)
 
         result: Dict[str, torch.Tensor] = {
             "z_pred": z_pred,

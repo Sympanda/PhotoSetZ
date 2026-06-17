@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 CKPT_END_TO_END  = "best_model.pt"
 CKPT_POINT       = "best_point.pt"
 CKPT_POSTERIOR   = "best_posterior.pt"
+CKPT_SBI_NPE     = "best_sbi_npe.pt"
 
 CALIB_DIR        = "calibration"
 POST_HOC_FILE    = "calibration/post_hoc.json"
@@ -44,7 +45,7 @@ def run_is_complete(run_dir: Path) -> bool:
     if not (run_dir / "config.yaml").exists():
         return False
     return any((run_dir / name).exists() for name in (
-        CKPT_END_TO_END, CKPT_POINT, CKPT_POSTERIOR,
+        CKPT_END_TO_END, CKPT_POINT, CKPT_POSTERIOR, CKPT_SBI_NPE,
     ))
 
 
@@ -53,7 +54,7 @@ def available_roles(run_dir: Path) -> List[str]:
     roles: List[str] = []
     if (run_dir / CKPT_POINT).exists():
         roles.append(ROLE_POINT)
-    if (run_dir / CKPT_POSTERIOR).exists():
+    if (run_dir / CKPT_POSTERIOR).exists() or (run_dir / CKPT_SBI_NPE).exists():
         roles.append(ROLE_POSTERIOR)
         if (run_dir / POST_HOC_FILE).exists():
             roles.append(ROLE_CALIBRATED)
@@ -77,8 +78,8 @@ def checkpoint_path(run_dir: Path, role: str) -> Optional[Path]:
     """Resolve checkpoint file for a model role."""
     mapping = {
         ROLE_POINT:      CKPT_POINT,
-        ROLE_POSTERIOR:  CKPT_POSTERIOR,
-        ROLE_CALIBRATED: CKPT_POSTERIOR,
+        ROLE_POSTERIOR:  CKPT_SBI_NPE if (run_dir / CKPT_SBI_NPE).exists() else CKPT_POSTERIOR,
+        ROLE_CALIBRATED: CKPT_SBI_NPE if (run_dir / CKPT_SBI_NPE).exists() else CKPT_POSTERIOR,
         ROLE_END_TO_END: CKPT_END_TO_END,
     }
     name = mapping.get(role)
@@ -98,9 +99,12 @@ def load_post_hoc(run_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def post_hoc_sigma_scale(run_dir: Path) -> Optional[float]:
+    """Return calibration scale: MDN σ-scale or NSF grid temperature."""
     data = load_post_hoc(run_dir)
     if data is None:
         return None
+    if "temperature" in data:
+        return float(data["temperature"])
     return float(data.get("sigma_scale", 1.0))
 
 

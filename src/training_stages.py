@@ -13,6 +13,14 @@ import torch.nn as nn
 from src.config import Config, StageTrainingConfig
 from src.run_artifacts import CKPT_POINT
 
+# Training fields a stage block may override (None → inherit top-level training.*).
+STAGE_TRAINING_OVERRIDE_FIELDS = (
+    "epochs", "lr", "weight_decay", "lr_scheduler", "warmup_epochs",
+    "clip_grad_norm", "batch_size", "early_stop_patience", "early_stop_min_epoch",
+    "fisher_lambda", "spread_lambda", "huber_lambda", "huber_delta",
+    "val_dropout", "full_filter_epochs", "dropout_resume_lr_mult",
+)
+
 
 def apply_stage_overrides(
     cfg: Config,
@@ -27,16 +35,28 @@ def apply_stage_overrides(
     elif default_head:
         c.head.type = default_head
 
-    for attr in (
-        "epochs", "lr", "warmup_epochs", "early_stop_patience",
-        "early_stop_min_epoch", "fisher_lambda", "spread_lambda", "huber_lambda",
-    ):
+    for attr in STAGE_TRAINING_OVERRIDE_FIELDS:
         val = getattr(stage, attr)
         if val is not None:
             setattr(c.training, attr, val)
     if stage.use_coverage is not None:
         c.model.use_coverage = stage.use_coverage
     return c
+
+
+def format_stage_training_summary(tc) -> str:
+    """One-line summary of effective training hyperparameters for a stage."""
+    parts = [
+        f"lr={tc.lr:.2e}",
+        f"wd={tc.weight_decay:.2e}",
+        f"sched={tc.lr_scheduler}",
+        f"bs={tc.batch_size}",
+    ]
+    if tc.warmup_epochs:
+        parts.append(f"warmup={tc.warmup_epochs}")
+    if tc.clip_grad_norm > 0:
+        parts.append(f"clip={tc.clip_grad_norm}")
+    return "  ".join(parts)
 
 
 def freeze_module(mod: nn.Module) -> None:
@@ -50,8 +70,9 @@ def unfreeze_module(mod: nn.Module) -> None:
 
 
 def load_encoder_weights(model: nn.Module, checkpoint: Path) -> None:
-    """Load encoder.* tensors from a full DeepSetZ state dict."""
+    """Load encoder.* and optional bottleneck.* from a full DeepSetZ checkpoint."""
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+
     enc_state = {
         k.replace("encoder.", "", 1): v
         for k, v in state.items()
@@ -61,9 +82,25 @@ def load_encoder_weights(model: nn.Module, checkpoint: Path) -> None:
         raise ValueError(f"No encoder weights found in {checkpoint}")
     model.encoder.load_state_dict(enc_state)
 
+    bottle_state = {
+        k.replace("bottleneck.", "", 1): v
+        for k, v in state.items()
+        if k.startswith("bottleneck.")
+    }
+    if bottle_state:
+        if getattr(model, "bottleneck", None) is None:
+            raise ValueError(
+                f"Checkpoint {checkpoint.name} contains bottleneck weights but "
+                "the model was built with bottleneck disabled."
+            )
+        model.bottleneck.load_state_dict(bottle_state)
+
 
 def encoder_param_count(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.encoder.parameters())
+    n = sum(p.numel() for p in model.encoder.parameters())
+    if getattr(model, "bottleneck", None) is not None:
+        n += sum(p.numel() for p in model.bottleneck.parameters())
+    return n
 
 
 def resolve_stage1_checkpoint(path: str | Path, root: Path) -> Path:

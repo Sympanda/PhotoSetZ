@@ -31,6 +31,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.dataloader_utils import resolve_num_workers
+from src.dataset import GalaxyDataset, collate_fn
+from src.data_options import dataset_kwargs_from_config
 
 OUTLIER_THRESHOLD = 0.15
 
@@ -196,7 +198,7 @@ def evaluate_checkpoint(
 
     from src.config import load_config
     from src.dataset import GalaxyDataset, collate_fn
-    from src.train import build_model, get_device
+    from src.checkpoint_loader import load_model_from_checkpoint
 
     cfg = load_config(config_path)
     root = Path(checkpoint_path).parent.parent  # assumes outputs/<run>/best_model.pt
@@ -205,13 +207,13 @@ def evaluate_checkpoint(
     res_dir   = Path(__file__).parent.parent / cfg.data.res_dir
 
     test_ds = GalaxyDataset(
-        parquet_path   = test_path,
-        res_dir        = res_dir,
-        target_col     = cfg.data.target_col,
-        dropout_cfg    = None,
-        active_surveys = cfg.data.active_surveys or None,
-        log_target     = cfg.data.log_target,
-        include_errors = cfg.data.include_errors,
+        parquet_path=test_path,
+        res_dir=res_dir,
+        target_col=cfg.data.target_col,
+        dropout_cfg=None,
+        active_surveys=cfg.data.active_surveys or None,
+        log_target=cfg.data.log_target,
+        **dataset_kwargs_from_config(cfg.data),
     )
     test_loader = DataLoader(
         test_ds,
@@ -222,8 +224,9 @@ def evaluate_checkpoint(
     )
 
     device = get_device()
-    model  = build_model(cfg, device=device)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model  = load_model_from_checkpoint(
+        cfg, checkpoint_path, device=device, n_total_filters=test_ds.n_filters,
+    )
     model.eval()
 
     z_preds, z_trues = [], []
